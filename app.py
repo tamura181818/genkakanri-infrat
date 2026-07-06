@@ -17,6 +17,7 @@
   streamlit run app.py
 """
 import re, json
+from datetime import date
 import pandas as pd
 import streamlit as st
 
@@ -24,7 +25,9 @@ st.set_page_config(page_title="見積・請求 取込 / 原価管理", layout="w
 
 KUBUN = ["材料", "機械", "労務", "経費"]
 SHEET_MI, SHEET_JI, SHEET_MASTER = "見積取込", "実績取込", "工種マスタ"
+SHEET_YOSAN = "実行予算"
 COLS = ["工種", "区分", "項目", "数量", "単位", "単価", "金額"]
+DEFAULT_TAX = 10  # 税率(%) 既定値
 
 def to_num(x):
     if x is None: return 0
@@ -62,6 +65,32 @@ def get_koshu(sid):
 def append_rows(sid, sheet_name, rows):
     ws = get_client().open_by_key(sid).worksheet(sheet_name)
     ws.append_rows(rows, value_input_option="USER_ENTERED")
+
+def get_or_create_ws(sid, name):
+    sh = get_client().open_by_key(sid)
+    try:
+        return sh.worksheet(name)
+    except Exception:
+        return sh.add_worksheet(title=name, rows=200, cols=12)
+
+def replace_sheet(sid, name, header, rows):
+    """シート全体をヘッダ＋rowsで置き換える（実行予算の凍結に使用）。"""
+    ws = get_or_create_ws(sid, name)
+    ws.clear()
+    ws.update([header] + rows, value_input_option="USER_ENTERED")
+
+def count_existing(sid, sheet_name, gyosha, date_col, date_val):
+    """同一業者・同一日付の既存行数を返す（重複取込の検知）。"""
+    gyosha, date_val = str(gyosha).strip(), str(date_val).strip()
+    if not gyosha or not date_val:
+        return 0
+    df, err = read_records(sid, sheet_name)
+    if err or df is None or df.empty:
+        return 0
+    if "業者名" not in df.columns or date_col not in df.columns:
+        return 0
+    mask = (df["業者名"].astype(str).str.strip() == gyosha) & (df[date_col].astype(str).str.strip() == date_val)
+    return int(mask.sum())
 
 # ── シート読み込み（原価管理ダッシュボード用）──
 @st.cache_data(ttl=120)
@@ -175,6 +204,16 @@ def render_import(koji, sid, koshu):
         ver = h3.selectbox("版", ["当初", "変更", "追加"])
         keiyaku = "未契約" if ver == "追加" else "契約済"
 
+    # 税区分：内部は必ず税抜で保存し、予実を同じ土俵で比較する
+    t1, t2 = st.columns([2, 1])
+    zeikei = t1.radio("入力金額の税区分", ["税抜", "税込"], horizontal=True,
+                      help="請求書・見積書の金額が税込の場合は『税込』を選ぶと、税抜に換算して保存します。")
+    zeiritsu = t2.number_input("税率(%)", min_value=0, max_value=20, value=DEFAULT_TAX) if zeikei == "税込" else DEFAULT_TAX
+
+    def to_net(v):
+        n = to_num(v)
+        return n / (1 + zeiritsu / 100) if zeikei == "税込" else n
+
     up = st.file_uploader(f"{('請求' if is_seikyu else '見積')}書（Excel / PDF / 写真）を上げてAI読み取り（任意）",
                           type=["xlsx", "xls", "pdf", "png", "jpg", "jpeg"])
 
@@ -205,42 +244,57 @@ def render_import(koji, sid, koshu):
         q, u, a = to_num(row.get("数量")), to_num(row.get("単価")), to_num(row.get("金額"))
         return q * u if (q and u) else a
     edited = edited.copy()
-    edited["金額計"] = edited.apply(calc_amt, axis=1)
+    edited["金額計"] = edited.apply(calc_amt, axis=1)          # 入力ベース（税抜/税込そのまま）
+    edited["税抜金額"] = edited["金額計"].apply(to_net)         # 保存・集計は税抜に統一
 
-    sums = {k: int(edited.loc[edited["区分"] == k, "金額計"].sum()) for k in KUBUN}
+    sums = {k: int(edited.loc[edited["区分"] == k, "税抜金額"].sum()) for k in KUBUN}
     m = st.columns(5)
     for i, k in enumerate(KUBUN): m[i].metric(k, f"¥{sums[k]:,}")
-    m[4].metric("合計", f"¥{sum(sums.values()):,}")
+    m[4].metric("合計（税抜）", f"¥{sum(sums.values()):,}")
+    if zeikei == "税込":
+        st.caption(f"税込入力を税率{int(zeiritsu)}%で税抜換算して集計・保存します。")
 
-    # 明細合計 と 手入力の伝票総額 の突合（拾い漏れ・二重計上の早期発見）
-    total = sum(sums.values())
-    denpyo = st.number_input("伝票の総額（任意・突合用）", min_value=0, value=0, step=1000,
-                             help="見積書・請求書に書かれた合計額を入れると、明細合計とのズレを表示します。")
+    # 明細合計 と 手入力の伝票総額 の突合（拾い漏れ・二重計上の早期発見）※入力ベースで比較
+    total_raw = int(edited["金額計"].sum())
+    denpyo = st.number_input(f"伝票の総額（任意・突合用／{zeikei}）", min_value=0, value=0, step=1000,
+                             help="見積書・請求書に書かれた合計額（入力金額と同じ税区分）を入れると、明細合計とのズレを表示します。")
     if denpyo:
-        diff = total - int(denpyo)
+        diff = total_raw - int(denpyo)
         if diff == 0:
             st.success("明細合計と伝票総額が一致しています。")
         else:
-            st.warning(f"明細合計と伝票総額に {abs(diff):,} 円のズレがあります（明細 {total:,} / 伝票 {int(denpyo):,}）。値引き・一式・拾い漏れをご確認ください。")
+            st.warning(f"明細合計と伝票総額に {abs(diff):,} 円のズレがあります（明細 {total_raw:,} / 伝票 {int(denpyo):,}）。値引き・一式・拾い漏れをご確認ください。")
+
+    # 重複取込チェック：同一業者・同一日付が既にあれば警告し、承知の上でのみ保存を許可
+    target_sheet = SHEET_JI if is_seikyu else SHEET_MI
+    date_col = "請求日" if is_seikyu else "見積日"
+    dupe_n = count_existing(sid, target_sheet, gyosha, date_col, hiduke)
+    allow_dupe = True
+    if dupe_n:
+        st.warning(f"⚠ 同じ業者「{gyosha}」・{date_col}「{hiduke}」のデータが既に {dupe_n} 行あります。二重計上の可能性があります。")
+        allow_dupe = st.checkbox("重複を承知の上で保存する")
 
     if st.button(f"{'請求' if is_seikyu else '見積'}を保存（{koji} のシートに追記）", type="primary"):
-        valid = edited[(edited["工種"].astype(str) != "") & (edited["金額計"] > 0)]
-        if valid.empty:
-            st.error("工種と金額が入った行がありません。")
+        if dupe_n and not allow_dupe:
+            st.error("重複の可能性があります。内容を確認し、問題なければ『重複を承知の上で保存する』にチェックしてください。")
         else:
-            try:
-                if is_seikyu:
-                    rows = [[r["工種"], r["区分"], r["項目"], int(r["金額計"]), gyosha, hiduke, shiharai] for _, r in valid.iterrows()]
-                    append_rows(sid, SHEET_JI, rows)
-                else:
-                    rows = [[r["工種"], ver, r["区分"], r["項目"], to_num(r["数量"]) or "", r["単位"],
-                             to_num(r["単価"]) or "", int(r["金額計"]), gyosha, hiduke, keiyaku] for _, r in valid.iterrows()]
-                    append_rows(sid, SHEET_MI, rows)
-                st.success(f"{koji} の「{SHEET_JI if is_seikyu else SHEET_MI}」に {len(rows)} 行を追記しました。台帳が自動更新されます。")
-                read_records.clear()  # ダッシュボードのキャッシュを更新
-                st.session_state.rows = default_rows()
-            except Exception as e:
-                st.error(f"保存に失敗しました。共有と secrets 設定を確認してください。詳細: {e}")
+            valid = edited[(edited["工種"].astype(str) != "") & (edited["税抜金額"] > 0)]
+            if valid.empty:
+                st.error("工種と金額が入った行がありません。")
+            else:
+                try:
+                    if is_seikyu:
+                        rows = [[r["工種"], r["区分"], r["項目"], int(round(r["税抜金額"])), gyosha, hiduke, shiharai] for _, r in valid.iterrows()]
+                        append_rows(sid, SHEET_JI, rows)
+                    else:
+                        rows = [[r["工種"], ver, r["区分"], r["項目"], to_num(r["数量"]) or "", r["単位"],
+                                 int(round(to_net(r["単価"]))) or "", int(round(r["税抜金額"])), gyosha, hiduke, keiyaku] for _, r in valid.iterrows()]
+                        append_rows(sid, SHEET_MI, rows)
+                    st.success(f"{koji} の「{target_sheet}」に {len(rows)} 行を税抜で追記しました。台帳が自動更新されます。")
+                    read_records.clear()  # ダッシュボードのキャッシュを更新
+                    st.session_state.rows = default_rows()
+                except Exception as e:
+                    st.error(f"保存に失敗しました。共有と secrets 設定を確認してください。詳細: {e}")
 
 # ────────────────────────────────────────────────────────
 # 原価管理タブ（予実対比ダッシュボード）
@@ -253,20 +307,28 @@ def render_dashboard(koji, sid):
 
     bud_raw, e1 = read_records(sid, SHEET_MI)
     act_raw, e2 = read_records(sid, SHEET_JI)
+    yosan_raw, _ = read_records(sid, SHEET_YOSAN)
     if e1: st.warning(f"「{SHEET_MI}」を読めませんでした: {e1}")
     if e2: st.warning(f"「{SHEET_JI}」を読めませんでした: {e2}")
     bud = bud_raw if bud_raw is not None else pd.DataFrame()
     act = act_raw if act_raw is not None else pd.DataFrame()
 
-    # 実行予算の対象（見積の版）を選択：当初のみ / 当初+変更 / すべて など
-    if not bud.empty and "版" in bud.columns:
-        present = [v for v in ["当初", "変更", "追加"] if v in set(bud["版"].astype(str))]
-        sel = st.multiselect("実行予算に含める見積の版", present, default=present,
-                             help="通常は当初＋変更＋追加の合計を実行予算とみなします。当初だけに絞ることもできます。")
-        if sel:
-            bud = bud[bud["版"].astype(str).isin(sel)]
+    # 基準＝確定済みの実行予算。無ければ見積を予算とみなす（フォールバック）
+    use_yosan = (yosan_raw is not None and not yosan_raw.empty and {"工種", "区分", "予算金額"} <= set(yosan_raw.columns))
+    if use_yosan:
+        bpiv = pivot_amount(yosan_raw, "予算金額")
+        st.caption("基準＝**実行予算（確定）**。実行予算 vs 実績原価で対比しています。")
+    else:
+        # 実行予算 未確定：見積を予算とみなす。版で範囲を選択可能。
+        if not bud.empty and "版" in bud.columns:
+            present = [v for v in ["当初", "変更", "追加"] if v in set(bud["版"].astype(str))]
+            sel = st.multiselect("見積の版（実行予算 未確定のため見積を予算とみなします）", present, default=present,
+                                 help="『実行予算』タブで確定すると、この見積フォールバックではなく確定予算が基準になります。")
+            if sel:
+                bud = bud[bud["版"].astype(str).isin(sel)]
+        bpiv = pivot_amount(bud)
+        st.info("実行予算が未確定のため、**見積を予算とみなして**表示しています。『🎯 実行予算』タブで確定すると精度が上がります。")
 
-    bpiv = pivot_amount(bud)
     apiv = pivot_amount(act)
     m = pd.DataFrame({"実行予算": bpiv, "実績原価": apiv}).fillna(0)
     if m.empty:
@@ -330,6 +392,75 @@ def render_dashboard(koji, sid):
     st.bar_chart(chart)
 
 # ────────────────────────────────────────────────────────
+# 実行予算タブ（見積から作成 → 調整 → 確定/凍結）
+# ────────────────────────────────────────────────────────
+def render_budget(koji, sid):
+    st.subheader(f"🎯 {koji} の実行予算")
+    st.caption("見積を集計して実行予算のたたき台を作り、金額を調整して『確定（凍結）』すると、以後の原価管理はこの実行予算を基準に予実対比します。金額はすべて税抜です。")
+
+    bud_raw, e1 = read_records(sid, SHEET_MI)
+    if e1: st.warning(f"「{SHEET_MI}」を読めませんでした: {e1}")
+    bud = bud_raw if bud_raw is not None else pd.DataFrame()
+    est = pivot_amount(bud)  # 見積 by 工種×区分（税抜）
+
+    yosan_raw, _ = read_records(sid, SHEET_YOSAN)
+    frozen = {}
+    if yosan_raw is not None and not yosan_raw.empty and {"工種", "区分", "予算金額"} <= set(yosan_raw.columns):
+        for _, r in yosan_raw.iterrows():
+            frozen[(str(r["工種"]).strip(), str(r["区分"]).strip())] = to_num(r["予算金額"])
+        conf = yosan_raw["確定日"].dropna().astype(str) if "確定日" in yosan_raw.columns else pd.Series([], dtype=str)
+        st.success(f"実行予算は確定済みです（{len(frozen)}件{'・確定日 ' + conf.iloc[-1] if not conf.empty else ''}）。金額を直して再確定できます。")
+
+    keys = set(est.index) | set(frozen.keys())
+    if not keys:
+        st.info("見積データがありません。先に『📥 取込』タブで見積を保存してください。")
+        return
+
+    base = []
+    for (k, ku) in sorted(keys):
+        mitsumori = int(est.get((k, ku), 0))
+        yosan = int(frozen.get((k, ku), mitsumori))
+        base.append({"工種": k, "区分": ku, "見積合計": mitsumori, "予算金額": yosan})
+    base_df = pd.DataFrame(base)
+
+    st.markdown("#### 工種・区分別の実行予算（予算金額を調整できます・行の追加も可）")
+    edited = st.data_editor(
+        base_df, use_container_width=True, num_rows="dynamic",
+        column_config={
+            "工種": st.column_config.SelectboxColumn("工種", options=get_koshu(sid) or [""]),
+            "区分": st.column_config.SelectboxColumn("区分", options=KUBUN),
+            "見積合計": st.column_config.NumberColumn("見積合計", disabled=True, format="¥%d"),
+            "予算金額": st.column_config.NumberColumn("予算金額", format="¥%d"),
+        })
+
+    yobi = st.number_input("予備費（工種『予備費』・区分『経費』として計上）", min_value=0, value=0, step=100000)
+    tot_est = int(pd.Series([to_num(v) for v in edited["見積合計"]]).sum())
+    tot_yosan = int(pd.Series([to_num(v) for v in edited["予算金額"]]).sum()) + int(yobi)
+    c = st.columns(3)
+    c[0].metric("見積合計（税抜）", f"¥{tot_est:,}")
+    c[1].metric("実行予算 計（税抜）", f"¥{tot_yosan:,}")
+    c[2].metric("見積との差", f"¥{tot_yosan - tot_est:,}")
+
+    st.warning("『確定』すると実行予算シート全体を上書きします（既存の実行予算は置き換わります）。")
+    if st.button("実行予算を確定（凍結）", type="primary"):
+        rows, today = [], date.today().isoformat()
+        for _, r in edited.iterrows():
+            k, ku, amt = str(r["工種"]).strip(), str(r["区分"]).strip(), int(round(to_num(r["予算金額"])))
+            if k and amt > 0:
+                rows.append([k, ku or "経費", amt, today])
+        if yobi > 0:
+            rows.append(["予備費", "経費", int(yobi), today])
+        if not rows:
+            st.error("予算金額の入った行がありません。")
+        else:
+            try:
+                replace_sheet(sid, SHEET_YOSAN, ["工種", "区分", "予算金額", "確定日"], rows)
+                read_records.clear()
+                st.success(f"実行予算を確定しました（{len(rows)}件）。『📊 原価管理』タブがこの実行予算を基準に対比します。")
+            except Exception as e:
+                st.error(f"確定に失敗しました。共有と secrets 設定を確認してください。詳細: {e}")
+
+# ────────────────────────────────────────────────────────
 st.title("見積・請求 取込 / 原価管理")
 
 projects = get_projects()
@@ -351,8 +482,10 @@ koshu = get_koshu(sid)
 if not koshu:
     st.info("この工事の工種マスタを読めませんでした。スプレッドシートがサービスアカウントに共有されているか確認してください。")
 
-tab_import, tab_dash = st.tabs(["📥 取込", "📊 原価管理"])
+tab_import, tab_budget, tab_dash = st.tabs(["📥 取込", "🎯 実行予算", "📊 原価管理"])
 with tab_import:
     render_import(koji, sid, koshu)
+with tab_budget:
+    render_budget(koji, sid)
 with tab_dash:
     render_dashboard(koji, sid)
