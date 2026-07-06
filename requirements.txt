@@ -1,7 +1,6 @@
 streamlit
 gspread
 google-auth
-pdfplumber
-openpyxl
 pandas
+openpyxl
 google-generativeai
