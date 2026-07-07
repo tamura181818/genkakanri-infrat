@@ -26,6 +26,8 @@ st.set_page_config(page_title="見積・請求 取込 / 原価管理", layout="w
 KUBUN = ["材料", "機械", "労務", "経費"]
 SHEET_MI, SHEET_JI, SHEET_MASTER = "見積取込", "実績取込", "工種マスタ"
 SHEET_YOSAN = "実行予算"
+SHEET_HATCHU = "発注"
+SHEET_DEKI = "出来高"
 COLS = ["工種", "区分", "項目", "数量", "単位", "単価", "金額"]
 DEFAULT_TAX = 10  # 税率(%) 既定値
 
@@ -92,35 +94,57 @@ def count_existing(sid, sheet_name, gyosha, date_col, date_val):
     mask = (df["業者名"].astype(str).str.strip() == gyosha) & (df[date_col].astype(str).str.strip() == date_val)
     return int(mask.sum())
 
-# ── シート読み込み（原価管理ダッシュボード用）──
-@st.cache_data(ttl=120)
-def read_records(sid, sheet_name):
-    """シートを DataFrame で返す。ヘッダ行（工種・区分を含む行）を自動検出する。"""
-    try:
-        ws = get_client().open_by_key(sid).worksheet(sheet_name)
-        values = ws.get_all_values()
-    except Exception as e:
-        return None, str(e)
-    if not values:
-        return pd.DataFrame(), None
-    header_idx = 0
-    for i, row in enumerate(values[:6]):
-        if "工種" in row and "区分" in row:
-            header_idx = i
-            break
-    header = values[header_idx]
-    data = values[header_idx + 1:]
-    # 列名の重複・空を安全化
+def overwrite_ws(sid, name, matrix):
+    """シート全体を matrix（ヘッダ含む行の配列）で置き換える（修正・取消に使用）。"""
+    ws = get_or_create_ws(sid, name)
+    ws.clear()
+    if matrix:
+        ws.update(matrix, value_input_option="USER_ENTERED")
+
+def uniquify(header):
+    """ヘッダの空・重複を安全な列名に整える。"""
     seen, cols = {}, []
     for j, h in enumerate(header):
-        name = h.strip() or f"col{j}"
+        name = str(h).strip() or f"col{j}"
         if name in seen:
             seen[name] += 1; name = f"{name}_{seen[name]}"
         else:
             seen[name] = 0
         cols.append(name)
-    df = pd.DataFrame(data, columns=cols)
-    return df, None
+    return cols
+
+# ── シート読み込み（原価管理ダッシュボード用）──
+@st.cache_data(ttl=120)
+def read_sheet_raw(sid, sheet_name):
+    """シートの全セルとヘッダ行位置を返す。(values, header_idx, err)。"""
+    try:
+        ws = get_client().open_by_key(sid).worksheet(sheet_name)
+        values = ws.get_all_values()
+    except Exception as e:
+        return None, 0, str(e)
+    if not values:
+        return [], 0, None
+    header_idx = 0
+    for i, row in enumerate(values[:6]):
+        if "工種" in row:
+            header_idx = i
+            break
+    return values, header_idx, None
+
+def read_records(sid, sheet_name):
+    """シートを DataFrame で返す。ヘッダ行を自動検出する（read_sheet_raw のキャッシュを利用）。"""
+    values, header_idx, err = read_sheet_raw(sid, sheet_name)
+    if err:
+        return None, err
+    if not values:
+        return pd.DataFrame(), None
+    header = uniquify(values[header_idx])
+    width = len(header)
+    data = [(row + [""] * width)[:width] for row in values[header_idx + 1:]]
+    return pd.DataFrame(data, columns=header), None
+
+def clear_data_cache():
+    read_sheet_raw.clear()
 
 def pivot_amount(df, amount_col="金額"):
     """工種×区分ごとに金額を合算した Series を返す。"""
@@ -291,7 +315,7 @@ def render_import(koji, sid, koshu):
                                  int(round(to_net(r["単価"]))) or "", int(round(r["税抜金額"])), gyosha, hiduke, keiyaku] for _, r in valid.iterrows()]
                         append_rows(sid, SHEET_MI, rows)
                     st.success(f"{koji} の「{target_sheet}」に {len(rows)} 行を税抜で追記しました。台帳が自動更新されます。")
-                    read_records.clear()  # ダッシュボードのキャッシュを更新
+                    clear_data_cache()  # ダッシュボードのキャッシュを更新
                     st.session_state.rows = default_rows()
                 except Exception as e:
                     st.error(f"保存に失敗しました。共有と secrets 設定を確認してください。詳細: {e}")
@@ -303,15 +327,17 @@ def render_dashboard(koji, sid):
     top = st.columns([3, 1])
     top[0].subheader(f"📊 {koji} の原価管理（予実対比）")
     if top[1].button("🔄 最新に更新"):
-        read_records.clear()
+        clear_data_cache()
 
     bud_raw, e1 = read_records(sid, SHEET_MI)
     act_raw, e2 = read_records(sid, SHEET_JI)
     yosan_raw, _ = read_records(sid, SHEET_YOSAN)
+    hatchu_raw, _ = read_records(sid, SHEET_HATCHU)
     if e1: st.warning(f"「{SHEET_MI}」を読めませんでした: {e1}")
     if e2: st.warning(f"「{SHEET_JI}」を読めませんでした: {e2}")
     bud = bud_raw if bud_raw is not None else pd.DataFrame()
     act = act_raw if act_raw is not None else pd.DataFrame()
+    hatchu = hatchu_raw if hatchu_raw is not None else pd.DataFrame()
 
     # 基準＝確定済みの実行予算。無ければ見積を予算とみなす（フォールバック）
     use_yosan = (yosan_raw is not None and not yosan_raw.empty and {"工種", "区分", "予算金額"} <= set(yosan_raw.columns))
@@ -330,24 +356,30 @@ def render_dashboard(koji, sid):
         st.info("実行予算が未確定のため、**見積を予算とみなして**表示しています。『🎯 実行予算』タブで確定すると精度が上がります。")
 
     apiv = pivot_amount(act)
-    m = pd.DataFrame({"実行予算": bpiv, "実績原価": apiv}).fillna(0)
+    hpiv = pivot_amount(hatchu, "発注金額")
+    m = pd.DataFrame({"実行予算": bpiv, "実績原価": apiv, "発注(コミット)": hpiv}).fillna(0)
     if m.empty:
         st.info("まだデータがありません。「取込」タブで見積・請求を保存してください。")
         return
-    m = m.reset_index().rename(columns={"level_0": "工種", "level_1": "区分"})
-    if "工種" not in m.columns:  # index名が付かない環境向けの保険
-        m.columns = ["工種", "区分", "実行予算", "実績原価"]
+    m = m.reset_index()
+    m.columns = ["工種", "区分", "実行予算", "実績原価", "発注(コミット)"]
     m["差異(残予算)"] = m["実行予算"] - m["実績原価"]
+    # コミット消化＝実績と発注の大きい方（未請求でも発注済みは消化とみなす）
+    m["コミット消化"] = m[["実績原価", "発注(コミット)"]].max(axis=1)
+    m["コミット残"] = m["実行予算"] - m["コミット消化"]
     m["消化率"] = m.apply(lambda r: (r["実績原価"] / r["実行予算"]) if r["実行予算"] else (1.0 if r["実績原価"] else 0.0), axis=1)
 
     tot_b, tot_a = m["実行予算"].sum(), m["実績原価"].sum()
+    tot_h, tot_c = m["発注(コミット)"].sum(), m["コミット消化"].sum()
 
     # ── KPIタイル ──
-    k = st.columns(4)
+    k = st.columns(5)
     k[0].metric("実行予算", f"¥{int(tot_b):,}")
     k[1].metric("実績原価", f"¥{int(tot_a):,}")
-    k[2].metric("残予算", f"¥{int(tot_b - tot_a):,}")
-    k[3].metric("消化率", f"{(tot_a / tot_b * 100 if tot_b else 0):.1f}%")
+    k[2].metric("発注(コミット)", f"¥{int(tot_h):,}")
+    k[3].metric("コミット込み残予算", f"¥{int(tot_b - tot_c):,}",
+                help="実行予算 −（実績と発注の大きい方）。発注済みで未請求の分も消化とみなした、本当の予算残です。")
+    k[4].metric("消化率", f"{(tot_a / tot_b * 100 if tot_b else 0):.1f}%")
 
     # ── 粗利（請負金額があれば）──
     default_uke = int(get_uketori(koji))
@@ -381,15 +413,79 @@ def render_dashboard(koji, sid):
     disp = m.sort_values(["工種", "区分"]).copy()
     disp["状態"] = disp["消化率"].map(lambda x: "⚠ 超過" if x > 1.0 else ("● 要注意" if x >= 0.9 else ""))
     disp["消化率"] = (disp["消化率"] * 100).round(1).map(lambda v: f"{v}%")
-    for c in ["実行予算", "実績原価", "差異(残予算)"]:
+    for c in ["実行予算", "実績原価", "発注(コミット)", "コミット残", "差異(残予算)"]:
         disp[c] = disp[c].map(lambda v: f"¥{int(v):,}")
-    st.dataframe(disp[["工種", "区分", "実行予算", "実績原価", "差異(残予算)", "消化率", "状態"]],
+    st.dataframe(disp[["工種", "区分", "実行予算", "実績原価", "発注(コミット)", "コミット残", "消化率", "状態"]],
                  use_container_width=True, hide_index=True)
 
     # ── 工種別チャート ──
     st.markdown("#### 工種別 予算 vs 実績")
     chart = m.groupby("工種")[["実行予算", "実績原価"]].sum()
     st.bar_chart(chart)
+
+    # ── 出来高 → 着地見込（EAC）──
+    render_eac(koji, sid, m)
+
+# ── 出来高（進捗）を入力し、着地見込原価（EAC）を算出 ──
+def render_eac(koji, sid, m):
+    st.markdown("#### 出来高 → 着地見込（EAC）")
+    st.caption("工種ごとの出来高（進捗％）を入れると、着地見込原価＝実績÷出来高率 を推定し、完成時の予算差異と赤字着地を早期に警告します。")
+
+    koshu_list = sorted(m["工種"].unique())
+    by_koshu = m.groupby("工種")[["実行予算", "実績原価"]].sum()
+
+    deki_raw, _ = read_records(sid, SHEET_DEKI)
+    saved = {}
+    if deki_raw is not None and not deki_raw.empty and {"工種", "出来高率"} <= set(deki_raw.columns):
+        for _, r in deki_raw.iterrows():
+            saved[str(r["工種"]).strip()] = to_num(r["出来高率"])
+
+    with st.expander("出来高（進捗％）を入力・更新する", expanded=not saved):
+        base = pd.DataFrame([{"工種": k, "出来高率(%)": int(saved.get(k, 0))} for k in koshu_list])
+        de = st.data_editor(base, use_container_width=True, hide_index=True,
+                            column_config={"工種": st.column_config.TextColumn("工種", disabled=True),
+                                           "出来高率(%)": st.column_config.NumberColumn("出来高率(%)", min_value=0, max_value=100)})
+        if st.button("出来高を保存"):
+            rows = [[str(r["工種"]).strip(), int(to_num(r["出来高率(%)"])), date.today().isoformat()]
+                    for _, r in de.iterrows() if str(r["工種"]).strip()]
+            try:
+                replace_sheet(sid, SHEET_DEKI, ["工種", "出来高率", "更新日"], rows)
+                clear_data_cache()
+                st.success("出来高を保存しました。着地見込を再計算します。")
+                saved = {r[0]: r[1] for r in rows}
+            except Exception as e:
+                st.error(f"保存に失敗しました。詳細: {e}")
+
+    if not saved:
+        st.info("出来高が未入力です。上の欄で入力すると着地見込を表示します。")
+        return
+
+    rows = []
+    for k in koshu_list:
+        b = float(by_koshu.loc[k, "実行予算"]); a = float(by_koshu.loc[k, "実績原価"])
+        rate = to_num(saved.get(k, 0)) / 100.0
+        eac = (a / rate) if rate > 0 else (b if b else a)  # 出来高比で完成時原価を推定
+        rows.append({"工種": k, "実行予算": b, "実績原価": a, "出来高率": rate, "着地見込(EAC)": eac,
+                     "完成時差異": b - eac})
+    e = pd.DataFrame(rows)
+    tb, te = e["実行予算"].sum(), e["着地見込(EAC)"].sum()
+
+    kpi = st.columns(3)
+    kpi[0].metric("実行予算 計", f"¥{int(tb):,}")
+    kpi[1].metric("着地見込原価 計", f"¥{int(te):,}")
+    kpi[2].metric("完成時の予算差異", f"¥{int(tb - te):,}",
+                  help="プラス＝予算内で着地見込／マイナス＝予算超過の着地見込")
+
+    over = e[e["完成時差異"] < 0]
+    if not over.empty:
+        st.error(f"⚠ 赤字（予算超過）着地の見込みが {len(over)} 工種あります: " + "、".join(over["工種"]))
+
+    ed = e.copy()
+    ed["出来高率"] = (ed["出来高率"] * 100).round(0).map(lambda v: f"{int(v)}%")
+    for c in ["実行予算", "実績原価", "着地見込(EAC)", "完成時差異"]:
+        ed[c] = ed[c].map(lambda v: f"¥{int(v):,}")
+    st.dataframe(ed[["工種", "実行予算", "実績原価", "出来高率", "着地見込(EAC)", "完成時差異"]],
+                 use_container_width=True, hide_index=True)
 
 # ────────────────────────────────────────────────────────
 # 実行予算タブ（見積から作成 → 調整 → 確定/凍結）
@@ -455,10 +551,115 @@ def render_budget(koji, sid):
         else:
             try:
                 replace_sheet(sid, SHEET_YOSAN, ["工種", "区分", "予算金額", "確定日"], rows)
-                read_records.clear()
+                clear_data_cache()
                 st.success(f"実行予算を確定しました（{len(rows)}件）。『📊 原価管理』タブがこの実行予算を基準に対比します。")
             except Exception as e:
                 st.error(f"確定に失敗しました。共有と secrets 設定を確認してください。詳細: {e}")
+
+# ────────────────────────────────────────────────────────
+# 発注タブ（契約＝コミット済原価の登録）
+# ────────────────────────────────────────────────────────
+def render_hatchu(koji, sid, koshu):
+    st.subheader(f"📦 {koji} の発注（契約）登録")
+    st.caption("業者への発注（契約）額を登録します。未請求でも『コミット済の原価』として原価管理の残予算に反映されます。金額はすべて税抜で保存します。")
+
+    h1, h2, h3 = st.columns(3)
+    gyosha = h1.text_input("業者名", key="hatchu_gyosha")
+    hduke = h2.text_input("発注日", placeholder="2026/07/31", key="hatchu_date")
+    zeikei = h3.radio("税区分", ["税抜", "税込"], horizontal=True, key="hatchu_tax")
+    zeiritsu = st.number_input("税率(%)", min_value=0, max_value=20, value=DEFAULT_TAX) if zeikei == "税込" else DEFAULT_TAX
+
+    def to_net(v):
+        n = to_num(v)
+        return n / (1 + zeiritsu / 100) if zeikei == "税込" else n
+
+    if "hatchu_rows" not in st.session_state:
+        st.session_state.hatchu_rows = pd.DataFrame([{"工種": "", "区分": "材料", "項目": "", "発注金額": 0}])
+    edited = st.data_editor(
+        st.session_state.hatchu_rows, use_container_width=True, num_rows="dynamic",
+        column_config={
+            "工種": st.column_config.SelectboxColumn("工種", options=koshu or [""]),
+            "区分": st.column_config.SelectboxColumn("区分", options=KUBUN),
+            "発注金額": st.column_config.NumberColumn("発注金額", format="¥%d"),
+        })
+    edited = edited.copy()
+    edited["税抜発注"] = edited["発注金額"].apply(to_net)
+    st.metric("発注合計（税抜）", f"¥{int(edited['税抜発注'].sum()):,}")
+
+    dupe_n = count_existing(sid, SHEET_HATCHU, gyosha, "発注日", hduke)
+    allow_dupe = True
+    if dupe_n:
+        st.warning(f"⚠ 同じ業者「{gyosha}」・発注日「{hduke}」の発注が既に {dupe_n} 行あります。二重登録の可能性があります。")
+        allow_dupe = st.checkbox("重複を承知の上で登録する", key="hatchu_dupe")
+
+    if st.button("発注を登録", type="primary"):
+        if dupe_n and not allow_dupe:
+            st.error("重複の可能性があります。確認のうえチェックしてください。")
+        else:
+            valid = edited[(edited["工種"].astype(str) != "") & (edited["税抜発注"] > 0)]
+            if valid.empty:
+                st.error("工種と発注金額が入った行がありません。")
+            else:
+                try:
+                    get_or_create_ws(sid, SHEET_HATCHU)  # 無ければ作成
+                    # ヘッダが無い新規シートには先にヘッダを入れる
+                    vals, _, _ = read_sheet_raw(sid, SHEET_HATCHU)
+                    if not vals:
+                        overwrite_ws(sid, SHEET_HATCHU, [["工種", "区分", "項目", "発注金額", "業者名", "発注日"]])
+                    rows = [[r["工種"], r["区分"], r["項目"], int(round(r["税抜発注"])), gyosha, hduke] for _, r in valid.iterrows()]
+                    append_rows(sid, SHEET_HATCHU, rows)
+                    clear_data_cache()
+                    st.success(f"発注を {len(rows)} 件登録しました。原価管理タブの『発注(コミット)』に反映されます。")
+                    st.session_state.hatchu_rows = pd.DataFrame([{"工種": "", "区分": "材料", "項目": "", "発注金額": 0}])
+                except Exception as e:
+                    st.error(f"登録に失敗しました。詳細: {e}")
+
+# ────────────────────────────────────────────────────────
+# 修正・取消タブ（シートを表で開いて行の編集・削除 → 全体を安全に上書き）
+# ────────────────────────────────────────────────────────
+def render_edit(koji, sid):
+    st.subheader(f"🛠 {koji} のデータ修正・取消")
+    st.caption("保存済みのデータを表で開き、セルの修正や行の削除ができます。『上書き保存』でシート全体を置き換えます（誤読の差し替え・二重計上の取消に使用）。")
+
+    label2sheet = {"見積取込": SHEET_MI, "実績取込": SHEET_JI, "発注": SHEET_HATCHU, "実行予算": SHEET_YOSAN}
+    pick = st.selectbox("編集するデータ", list(label2sheet.keys()))
+    sheet = label2sheet[pick]
+
+    if st.button("🔄 最新に読み込み"):
+        clear_data_cache()
+
+    vals, hidx, err = read_sheet_raw(sid, sheet)
+    if err:
+        st.warning(f"「{sheet}」を読めませんでした: {err}")
+        return
+    if not vals or len(vals) <= hidx + 1:
+        st.info("このシートには編集できるデータがありません。")
+        return
+
+    header = uniquify(vals[hidx])
+    width = len(header)
+    top = vals[:hidx + 1]  # タイトル行＋ヘッダ（保持する）
+    data = [(row + [""] * width)[:width] for row in vals[hidx + 1:]]
+    df = pd.DataFrame(data, columns=header)
+
+    st.markdown(f"#### {pick}（{len(df)} 行）— 行の削除・セルの修正ができます")
+    edited = st.data_editor(df, use_container_width=True, num_rows="dynamic", hide_index=True)
+
+    n_before, n_after = len(df), len(edited)
+    if n_after != n_before:
+        st.info(f"行数: {n_before} → {n_after}（{n_before - n_after:+d}）")
+
+    st.warning("『上書き保存』はシート全体を現在の表の内容に置き換えます。元に戻せません。内容をよくご確認ください。")
+    confirm = st.checkbox("内容を確認しました。上書き保存する")
+    if st.button("上書き保存", type="primary", disabled=not confirm):
+        try:
+            body = [[("" if pd.isna(v) else v) for v in row] for row in edited.values.tolist()]
+            matrix = top + body
+            overwrite_ws(sid, sheet, matrix)
+            clear_data_cache()
+            st.success(f"「{sheet}」を上書き保存しました（{len(body)} 行）。原価管理に反映されます。")
+        except Exception as e:
+            st.error(f"保存に失敗しました。詳細: {e}")
 
 # ────────────────────────────────────────────────────────
 st.title("見積・請求 取込 / 原価管理")
@@ -482,10 +683,15 @@ koshu = get_koshu(sid)
 if not koshu:
     st.info("この工事の工種マスタを読めませんでした。スプレッドシートがサービスアカウントに共有されているか確認してください。")
 
-tab_import, tab_budget, tab_dash = st.tabs(["📥 取込", "🎯 実行予算", "📊 原価管理"])
+tab_import, tab_budget, tab_hatchu, tab_dash, tab_edit = st.tabs(
+    ["📥 取込", "🎯 実行予算", "📦 発注", "📊 原価管理", "🛠 修正・取消"])
 with tab_import:
     render_import(koji, sid, koshu)
 with tab_budget:
     render_budget(koji, sid)
+with tab_hatchu:
+    render_hatchu(koji, sid, koshu)
 with tab_dash:
     render_dashboard(koji, sid)
+with tab_edit:
+    render_edit(koji, sid)
