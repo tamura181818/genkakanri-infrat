@@ -28,6 +28,7 @@ SHEET_MI, SHEET_JI, SHEET_MASTER = "見積取込", "実績取込", "工種マス
 SHEET_YOSAN = "実行予算"
 SHEET_HATCHU = "発注"
 SHEET_DEKI = "出来高"
+SHEET_REPORT = "原価サマリ"
 COLS = ["工種", "区分", "項目", "数量", "単位", "単価", "金額"]
 DEFAULT_TAX = 10  # 税率(%) 既定値
 
@@ -158,6 +159,42 @@ def pivot_amount(df, amount_col="金額"):
     if d.empty:
         return pd.Series(dtype=float)
     return d.groupby(["工種", "区分"])[amount_col].sum()
+
+# ── 実行予算の版管理 ──
+def load_yosan(sid):
+    """実行予算シートを (df[版付き], 最新版番号) で返す。版列が無い旧データは版1とみなす。"""
+    df, err = read_records(sid, SHEET_YOSAN)
+    if err or df is None or df.empty or not ({"工種", "区分", "予算金額"} <= set(df.columns)):
+        return pd.DataFrame(), 0
+    df = df.copy()
+    if "版" not in df.columns:
+        df["版"] = 1
+    df["版"] = df["版"].apply(lambda v: int(to_num(v)) or 1)
+    df = df[df["工種"].astype(str).str.strip() != ""]
+    if df.empty:
+        return pd.DataFrame(), 0
+    return df, int(df["版"].max())
+
+def yosan_current(sid):
+    """最新版の実行予算だけを返す。"""
+    df, latest = load_yosan(sid)
+    if df.empty:
+        return pd.DataFrame(), 0
+    return df[df["版"] == latest].copy(), latest
+
+def freeze_yosan(sid, triples):
+    """(工種,区分,金額) のリストを新しい版として確定。既存版は履歴として保持する。"""
+    df, latest = load_yosan(sid)
+    newver = latest + 1
+    today = date.today().isoformat()
+    header = ["版", "工種", "区分", "予算金額", "確定日"]
+    existing = []
+    for _, r in df.iterrows():
+        existing.append([int(r["版"]), r["工種"], r["区分"], int(to_num(r["予算金額"])),
+                         str(r["確定日"]) if "確定日" in df.columns else ""])
+    new_rows = [[newver, k, ku, amt, today] for (k, ku, amt) in triples]
+    overwrite_ws(sid, SHEET_YOSAN, [header] + existing + new_rows)
+    return newver
 
 # ── 見積の読み取り（全形式をAI＝Geminiで判断）──
 PROMPT = ("建設の下請け見積書です。明細行をすべて抽出してください。"
@@ -331,7 +368,7 @@ def render_dashboard(koji, sid):
 
     bud_raw, e1 = read_records(sid, SHEET_MI)
     act_raw, e2 = read_records(sid, SHEET_JI)
-    yosan_raw, _ = read_records(sid, SHEET_YOSAN)
+    ycur, yver = yosan_current(sid)
     hatchu_raw, _ = read_records(sid, SHEET_HATCHU)
     if e1: st.warning(f"「{SHEET_MI}」を読めませんでした: {e1}")
     if e2: st.warning(f"「{SHEET_JI}」を読めませんでした: {e2}")
@@ -339,11 +376,11 @@ def render_dashboard(koji, sid):
     act = act_raw if act_raw is not None else pd.DataFrame()
     hatchu = hatchu_raw if hatchu_raw is not None else pd.DataFrame()
 
-    # 基準＝確定済みの実行予算。無ければ見積を予算とみなす（フォールバック）
-    use_yosan = (yosan_raw is not None and not yosan_raw.empty and {"工種", "区分", "予算金額"} <= set(yosan_raw.columns))
+    # 基準＝確定済みの実行予算（最新版）。無ければ見積を予算とみなす（フォールバック）
+    use_yosan = not ycur.empty
     if use_yosan:
-        bpiv = pivot_amount(yosan_raw, "予算金額")
-        st.caption("基準＝**実行予算（確定）**。実行予算 vs 実績原価で対比しています。")
+        bpiv = pivot_amount(ycur, "予算金額")
+        st.caption(f"基準＝**実行予算 第{yver}版（確定）**。実行予算 vs 実績原価で対比しています。")
     else:
         # 実行予算 未確定：見積を予算とみなす。版で範囲を選択可能。
         if not bud.empty and "版" in bud.columns:
@@ -426,6 +463,17 @@ def render_dashboard(koji, sid):
     # ── 出来高 → 着地見込（EAC）──
     render_eac(koji, sid, m)
 
+    # ── スプレッドシートへレポート出力 ──
+    st.markdown("#### レポート出力")
+    st.caption(f"予実・発注・EAC のサマリをスプレッドシートの「{SHEET_REPORT}」シートに書き出します（税抜）。共有・印刷に使えます。")
+    if st.button("📄 スプレッドシートにレポート出力"):
+        try:
+            overwrite_ws(sid, SHEET_REPORT, build_report_matrix(koji, sid, m, uketori))
+            clear_data_cache()
+            st.success(f"「{SHEET_REPORT}」シートにレポートを出力しました。スプレッドシートでご確認ください。")
+        except Exception as e:
+            st.error(f"出力に失敗しました。詳細: {e}")
+
 # ── 出来高（進捗）を入力し、着地見込原価（EAC）を算出 ──
 def render_eac(koji, sid, m):
     st.markdown("#### 出来高 → 着地見込（EAC）")
@@ -492,20 +540,28 @@ def render_eac(koji, sid, m):
 # ────────────────────────────────────────────────────────
 def render_budget(koji, sid):
     st.subheader(f"🎯 {koji} の実行予算")
-    st.caption("見積を集計して実行予算のたたき台を作り、金額を調整して『確定（凍結）』すると、以後の原価管理はこの実行予算を基準に予実対比します。金額はすべて税抜です。")
+    st.caption("見積を集計してたたき台を作り、金額を調整して『確定（凍結）』すると新しい版として保存されます（過去版は履歴保持）。原価管理は常に最新版を基準に対比します。金額はすべて税抜です。")
 
     bud_raw, e1 = read_records(sid, SHEET_MI)
     if e1: st.warning(f"「{SHEET_MI}」を読めませんでした: {e1}")
     bud = bud_raw if bud_raw is not None else pd.DataFrame()
     est = pivot_amount(bud)  # 見積 by 工種×区分（税抜）
 
-    yosan_raw, _ = read_records(sid, SHEET_YOSAN)
+    ydf, latest = load_yosan(sid)
     frozen = {}
-    if yosan_raw is not None and not yosan_raw.empty and {"工種", "区分", "予算金額"} <= set(yosan_raw.columns):
-        for _, r in yosan_raw.iterrows():
+    if not ydf.empty:
+        ycur = ydf[ydf["版"] == latest]
+        for _, r in ycur.iterrows():
             frozen[(str(r["工種"]).strip(), str(r["区分"]).strip())] = to_num(r["予算金額"])
-        conf = yosan_raw["確定日"].dropna().astype(str) if "確定日" in yosan_raw.columns else pd.Series([], dtype=str)
-        st.success(f"実行予算は確定済みです（{len(frozen)}件{'・確定日 ' + conf.iloc[-1] if not conf.empty else ''}）。金額を直して再確定できます。")
+        st.success(f"現在の実行予算は**第{latest}版**です（{len(frozen)}件）。金額を直して確定すると第{latest + 1}版になります。")
+        with st.expander("版の履歴を見る"):
+            hist = ydf.copy(); hist["予算金額"] = hist["予算金額"].apply(to_num)
+            g = hist.groupby("版").agg(件数=("予算金額", "size"), 合計=("予算金額", "sum"))
+            if "確定日" in hist.columns:
+                g["確定日"] = hist.groupby("版")["確定日"].last()
+            g = g.reset_index().sort_values("版")
+            g["合計"] = g["合計"].map(lambda v: f"¥{int(v):,}")
+            st.dataframe(g, use_container_width=True, hide_index=True)
 
     keys = set(est.index) | set(frozen.keys())
     if not keys:
@@ -537,22 +593,23 @@ def render_budget(koji, sid):
     c[1].metric("実行予算 計（税抜）", f"¥{tot_yosan:,}")
     c[2].metric("見積との差", f"¥{tot_yosan - tot_est:,}")
 
-    st.warning("『確定』すると実行予算シート全体を上書きします（既存の実行予算は置き換わります）。")
-    if st.button("実行予算を確定（凍結）", type="primary"):
-        rows, today = [], date.today().isoformat()
+    nextver = latest + 1
+    st.warning(f"『確定』すると**第{nextver}版**として保存します（過去版は履歴に残ります）。")
+    if st.button(f"実行予算を第{nextver}版として確定（凍結）", type="primary"):
+        triples = []
         for _, r in edited.iterrows():
-            k, ku, amt = str(r["工種"]).strip(), str(r["区分"]).strip(), int(round(to_num(r["予算金額"])))
+            k, ku, amt = str(r["工種"]).strip(), (str(r["区分"]).strip() or "経費"), int(round(to_num(r["予算金額"])))
             if k and amt > 0:
-                rows.append([k, ku or "経費", amt, today])
+                triples.append((k, ku, amt))
         if yobi > 0:
-            rows.append(["予備費", "経費", int(yobi), today])
-        if not rows:
+            triples.append(("予備費", "経費", int(yobi)))
+        if not triples:
             st.error("予算金額の入った行がありません。")
         else:
             try:
-                replace_sheet(sid, SHEET_YOSAN, ["工種", "区分", "予算金額", "確定日"], rows)
+                nv = freeze_yosan(sid, triples)
                 clear_data_cache()
-                st.success(f"実行予算を確定しました（{len(rows)}件）。『📊 原価管理』タブがこの実行予算を基準に対比します。")
+                st.success(f"実行予算を**第{nv}版**として確定しました（{len(triples)}件）。『📊 原価管理』タブがこの版を基準に対比します。")
             except Exception as e:
                 st.error(f"確定に失敗しました。共有と secrets 設定を確認してください。詳細: {e}")
 
@@ -662,6 +719,110 @@ def render_edit(koji, sid):
             st.error(f"保存に失敗しました。詳細: {e}")
 
 # ────────────────────────────────────────────────────────
+# 支払予定・資金繰りタブ
+# ────────────────────────────────────────────────────────
+def render_payment(koji, sid):
+    st.subheader(f"💰 {koji} の支払予定・資金繰り")
+    st.caption("実績（請求）から支払サイトをもとに支払予定日を計算し、月別・業者別の支払見通しを表示します。")
+
+    act, err = read_records(sid, SHEET_JI)
+    if err:
+        st.warning(f"「{SHEET_JI}」を読めませんでした: {err}"); return
+    if act is None or act.empty or not ({"金額", "請求日"} <= set(act.columns)):
+        st.info("実績（請求）データがありません。『📥 取込』タブで請求を保存してください。")
+        return
+
+    c1, c2, c3 = st.columns(3)
+    site = c1.selectbox("支払サイト（締めの何ヶ月後に支払うか）", ["当月", "翌月", "翌々月", "3ヶ月後"], index=1)
+    payday = c2.selectbox("支払日", ["末日", "10日", "15日", "20日", "25日"])
+    zeikomi = c3.checkbox("税込で表示（資金繰りは税込が実額）", value=True)
+    zeiritsu = st.number_input("税率(%)", min_value=0, max_value=20, value=DEFAULT_TAX) if zeikomi else 0
+    months = {"当月": 0, "翌月": 1, "翌々月": 2, "3ヶ月後": 3}[site]
+
+    def pay_date(s):
+        d = pd.to_datetime(str(s), errors="coerce")
+        if pd.isna(d):
+            return pd.NaT
+        d = d + pd.DateOffset(months=months)
+        if payday == "末日":
+            return (d + pd.offsets.MonthEnd(0)).normalize()
+        day = int(payday.replace("日", ""))
+        return d.replace(day=min(day, d.days_in_month)).normalize()
+
+    df = act.copy()
+    df["金額"] = df["金額"].apply(to_num)
+    if zeikomi:
+        df["金額"] = df["金額"] * (1 + zeiritsu / 100)
+    df["支払予定日"] = df["請求日"].apply(pay_date)
+    unknown = int(df["支払予定日"].isna().sum())
+    df = df.dropna(subset=["支払予定日"])
+    if df.empty:
+        st.warning("請求日を日付として解釈できませんでした（例: 2026/07/31 の形式で入力してください）。")
+        return
+    df["支払予定月"] = df["支払予定日"].dt.strftime("%Y-%m")
+
+    st.metric(f"支払予定 合計（{'税込' if zeikomi else '税抜'}）", f"¥{int(df['金額'].sum()):,}")
+    if unknown:
+        st.caption(f"※ 請求日を解釈できなかった {unknown} 行を除外しています。")
+
+    st.markdown("#### 月別 支払予定")
+    monthly = df.groupby("支払予定月")["金額"].sum()
+    st.bar_chart(monthly)
+    mtab = monthly.reset_index(); mtab["金額"] = mtab["金額"].map(lambda v: f"¥{int(v):,}")
+    st.dataframe(mtab, use_container_width=True, hide_index=True)
+
+    if "業者名" in df.columns:
+        st.markdown("#### 業者別 × 月別 支払予定")
+        pv = df.pivot_table(index="業者名", columns="支払予定月", values="金額", aggfunc="sum", fill_value=0)
+        st.dataframe(pv.astype(int).applymap(lambda v: f"¥{v:,}"), use_container_width=True)
+
+    st.markdown("#### 支払明細")
+    show = ["支払予定日", "支払予定月"] + [c for c in ["業者名", "工種", "区分", "項目", "金額", "支払区分"] if c in df.columns]
+    detail = df[show].copy()
+    detail["支払予定日"] = detail["支払予定日"].dt.strftime("%Y-%m-%d")
+    detail["金額"] = detail["金額"].map(lambda v: f"¥{int(v):,}")
+    st.dataframe(detail.sort_values("支払予定日"), use_container_width=True, hide_index=True)
+
+# ── スプレッドシートへ出力する原価サマリを組み立てる ──
+def build_report_matrix(koji, sid, m, uketori):
+    today = date.today().isoformat()
+    tot_b = int(m["実行予算"].sum()); tot_a = int(m["実績原価"].sum())
+    tot_h = int(m["発注(コミット)"].sum()); tot_c = int(m["コミット消化"].sum())
+    rows = [
+        [f"原価管理サマリ：{koji}"],
+        [f"出力日 {today}（金額は税抜）"],
+        [],
+        ["実行予算", tot_b, "実績原価", tot_a, "発注(コミット)", tot_h],
+        ["コミット込み残予算", tot_b - tot_c, "消化率", f"{(tot_a / tot_b * 100 if tot_b else 0):.1f}%"],
+    ]
+    if uketori:
+        rows.append(["請負金額", int(uketori), "粗利(実績)", int(uketori - tot_a),
+                     "原価率", f"{(tot_a / uketori * 100):.1f}%"])
+    rows += [[], ["工種", "区分", "実行予算", "実績原価", "発注(コミット)", "コミット残", "消化率", "状態"]]
+    for _, r in m.sort_values(["工種", "区分"]).iterrows():
+        rate = (r["実績原価"] / r["実行予算"]) if r["実行予算"] else (1.0 if r["実績原価"] else 0.0)
+        state = "超過" if rate > 1.0 else ("要注意" if rate >= 0.9 else "")
+        rows.append([r["工種"], r["区分"], int(r["実行予算"]), int(r["実績原価"]),
+                     int(r["発注(コミット)"]), int(r["コミット残"]), f"{rate * 100:.1f}%", state])
+
+    deki, _ = read_records(sid, SHEET_DEKI)
+    saved = {}
+    if deki is not None and not deki.empty and {"工種", "出来高率"} <= set(deki.columns):
+        for _, r in deki.iterrows():
+            saved[str(r["工種"]).strip()] = to_num(r["出来高率"])
+    if saved:
+        rows += [[], ["【着地見込 EAC】"], ["工種", "実行予算", "実績原価", "出来高率", "着地見込(EAC)", "完成時差異"]]
+        by = m.groupby("工種")[["実行予算", "実績原価"]].sum()
+        for k in by.index:
+            b = float(by.loc[k, "実行予算"]); a = float(by.loc[k, "実績原価"])
+            rate = to_num(saved.get(k, 0)) / 100.0
+            eac = (a / rate) if rate > 0 else (b if b else a)
+            rows.append([k, int(b), int(a), f"{int(rate * 100)}%", int(eac), int(b - eac)])
+
+    w = max(len(r) for r in rows)
+    return [r + [""] * (w - len(r)) for r in rows]
+
+# ────────────────────────────────────────────────────────
 st.title("見積・請求 取込 / 原価管理")
 
 projects = get_projects()
@@ -683,8 +844,8 @@ koshu = get_koshu(sid)
 if not koshu:
     st.info("この工事の工種マスタを読めませんでした。スプレッドシートがサービスアカウントに共有されているか確認してください。")
 
-tab_import, tab_budget, tab_hatchu, tab_dash, tab_edit = st.tabs(
-    ["📥 取込", "🎯 実行予算", "📦 発注", "📊 原価管理", "🛠 修正・取消"])
+tab_import, tab_budget, tab_hatchu, tab_dash, tab_pay, tab_edit = st.tabs(
+    ["📥 取込", "🎯 実行予算", "📦 発注", "📊 原価管理", "💰 支払予定", "🛠 修正・取消"])
 with tab_import:
     render_import(koji, sid, koshu)
 with tab_budget:
@@ -693,5 +854,7 @@ with tab_hatchu:
     render_hatchu(koji, sid, koshu)
 with tab_dash:
     render_dashboard(koji, sid)
+with tab_pay:
+    render_payment(koji, sid)
 with tab_edit:
     render_edit(koji, sid)
