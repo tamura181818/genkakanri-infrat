@@ -164,8 +164,18 @@ def compress_pdf(data, target_dpi, quality):
                     changed += 1
                 except Exception:
                     pass
-    out = doc.tobytes(deflate=True, garbage=4, clean=True)
+
+    # 画像を1枚も変更していない（＝文字だけ等）なら、再保存はしない。
+    # PyMuPDFの再保存は最適化済みPDFを逆に膨らませることがあるため。
+    if changed == 0:
+        doc.close()
+        return data, 0
+
+    out = doc.tobytes(deflate=True, deflate_images=True, garbage=4, clean=True)
     doc.close()
+    # 万一、元より大きくなったら元のまま返す（絶対に膨らませない）
+    if len(out) >= len(data):
+        return data, 0
     return out, changed
 
 
@@ -175,16 +185,21 @@ _PDF_STEPS = [(200, 82), (180, 78), (160, 72), (150, 68), (130, 65), (120, 60), 
 
 def compress_pdf_to_target(data, target_bytes):
     """target_bytes 以下に収まるまで DPI/画質を段階的に下げる。
-    返り値:(bytes, 変更枚数, 使った設定文字列, 目標達成したか)"""
+    返り値:(bytes, 変更枚数, 使った設定文字列 or None, 目標達成したか)"""
+    # すでに目標以下なら何もしない
+    if len(data) <= target_bytes:
+        return data, 0, None, True
+
     best = data
     best_changed = 0
-    best_setting = "無圧縮"
+    best_setting = None
     for dpi, q in _PDF_STEPS:
         out, ch = compress_pdf(data, dpi, q)
         if len(out) < len(best):
             best, best_changed, best_setting = out, ch, f"{dpi}dpi / 画質{q}"
-        if len(out) <= target_bytes:
-            return out, ch, f"{dpi}dpi / 画質{q}", True
+        # 元より小さくなっていて、かつ目標を満たしたら確定
+        if best is not data and len(best) <= target_bytes:
+            return best, best_changed, best_setting, True
     return best, best_changed, best_setting, len(best) <= target_bytes
 
 
@@ -240,6 +255,10 @@ files = st.file_uploader(
     "ファイル（.pdf / .xlsx）を選ぶ（複数まとめてOK）",
     type=["pdf", "xlsx"], accept_multiple_files=True,
 )
+st.caption(
+    "💡 このツールは**写真・スキャン画像で重くなったファイル**に効きます。"
+    "文字だけの書類はもともと軽く、これ以上は小さくできません。"
+)
 
 if files and st.button("軽くする", type="primary"):
     results = []
@@ -255,19 +274,37 @@ if files and st.button("軽くする", type="primary"):
                     if target_mb is not None:
                         out, ch, setting, ok = compress_pdf_to_target(
                             data, int(target_mb * 1024 * 1024))
-                        rec["note"] = (
-                            f"設定: {setting} / 画像{ch}枚を圧縮"
-                            + ("" if ok else "　⚠ 目標サイズには届きませんでした（最小まで圧縮）")
-                        )
-                        rec["ok"] = ok
                     else:
                         out, ch = compress_pdf(data, pdf_dpi, pdf_q)
-                        rec["note"] = f"設定: {pdf_dpi}dpi / 画質{pdf_q} / 画像{ch}枚を圧縮"
+                        setting = f"{pdf_dpi}dpi / 画質{pdf_q}"
+                        ok = True
+                    if len(out) >= len(data):
+                        # 1バイトも減らなかった＝写真が無い/既に最適化済み
+                        rec["note"] = (
+                            "この書類は圧縮できる写真・画像が無い（または既に十分軽い）ため、"
+                            "これ以上は小さくできませんでした。元のファイルをそのままお使いください。"
+                        )
+                        rec["ok"] = False
+                    elif not ok:
+                        rec["note"] = (
+                            f"できるだけ圧縮しました（{setting} / 画像{ch}枚）が、"
+                            "目標サイズには届きませんでした。"
+                        )
+                        rec["ok"] = False
+                    else:
+                        rec["note"] = f"設定: {setting} / 画像{ch}枚を圧縮"
                         rec["ok"] = True
                 elif ext == "xlsx":
                     out, ch = compress_xlsx(data, xlsx_dim, xlsx_q, xlsx_png)
-                    rec["note"] = f"画像{ch}枚を圧縮"
-                    rec["ok"] = True
+                    if len(out) >= len(data):
+                        rec["note"] = (
+                            "このExcelは圧縮できる画像が無い（または既に十分軽い）ため、"
+                            "これ以上は小さくできませんでした。"
+                        )
+                        rec["ok"] = False
+                    else:
+                        rec["note"] = f"画像{ch}枚を圧縮"
+                        rec["ok"] = True
                 else:
                     raise RuntimeError("対応していない形式です。")
             rec["after"] = len(out)
@@ -289,10 +326,14 @@ for r in st.session_state.get("results", []):
     st.subheader(r["name"])
     c1, c2, c3 = st.columns(3)
     c1.metric("元のサイズ", human_size(before))
-    c2.metric("圧縮後", human_size(after), delta=f"-{human_size(saved)}", delta_color="inverse")
+    c2.metric("圧縮後", human_size(after),
+              delta=(f"-{human_size(saved)}" if saved > 0 else None), delta_color="inverse")
     c3.metric("削減率", f"{ratio:.0f}%")
     if r.get("note"):
         (st.caption if r.get("ok", True) else st.info)(r["note"])
+    if saved <= 0:
+        # 小さくできなかったので、ダウンロードは元ファイルと同じ。混乱を避けるため案内。
+        st.caption("※ ダウンロードしても中身・容量は元と同じです。")
     base, ext = os.path.splitext(r["name"])
     mime = ("application/pdf" if ext.lower() == ".pdf"
             else "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
