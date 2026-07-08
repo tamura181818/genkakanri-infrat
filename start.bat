@@ -7,13 +7,31 @@ echo   ファイル軽量化アプリ を起動します
 echo ============================================================
 echo.
 
-python --version >nul 2>&1
-if errorlevel 1 goto NOPYTHON
+REM --- 使えるPythonを自動で探す（py → python → python3 の順）---
+set "PYEXE="
 
+py -3 --version >nul 2>&1
+if not errorlevel 1 set "PYEXE=py -3"
+if defined PYEXE goto FOUND
+
+python --version >nul 2>&1
+if not errorlevel 1 set "PYEXE=python"
+if defined PYEXE goto FOUND
+
+python3 --version >nul 2>&1
+if not errorlevel 1 set "PYEXE=python3"
+if defined PYEXE goto FOUND
+
+goto NOPYTHON
+
+:FOUND
+echo 使用するPython:
+%PYEXE% --version
+echo.
 echo 必要な部品を準備しています...
 echo （初回だけ数分かかります。文字が流れている間は正常です。お待ちください）
 echo.
-python -m pip install --disable-pip-version-check -r requirements.txt
+%PYEXE% -m pip install --disable-pip-version-check -r requirements.txt
 if errorlevel 1 goto PIPERROR
 
 echo.
@@ -24,7 +42,7 @@ echo   ・社内の人には、下に出る Network URL を伝えてください
 echo   ・終了する時は、この画面で Ctrl + C を押します
 echo ------------------------------------------------------------
 echo.
-python -m streamlit run app.py --server.address=0.0.0.0 --server.port=8501
+%PYEXE% -m streamlit run app.py --server.address=0.0.0.0 --server.port=8501
 
 echo.
 echo アプリを終了しました。何かキーを押すと閉じます。
@@ -32,13 +50,13 @@ pause
 exit /b 0
 
 :NOPYTHON
-echo [エラー] Python が見つかりません。
+echo [エラー] Python を実行できませんでした（py / python / python3 のどれも反応しません）。
 echo.
-echo   Python をインストールしてください:
-echo     1. https://www.python.org/downloads/ を開く
-echo     2. 「Download Python」からインストーラを実行
-echo     3. 最初の画面で「Add python.exe to PATH」に必ずチェック
-echo     4. パソコンを再起動して、もう一度 start.bat を実行
+echo   Python は入っているのにこのエラーが出る場合は、PATH設定が原因です。
+echo     1. https://www.python.org/downloads/ からインストーラを再実行
+echo     2. 最初の画面で「Add python.exe to PATH」に必ずチェック
+echo        （既に入っている場合は「Modify」→ PATH を有効化）
+echo     3. パソコンを再起動して、もう一度 start.bat を実行
 echo.
 echo この画面は閉じません。確認したら何かキーを押してください。
 pause
