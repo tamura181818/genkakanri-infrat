@@ -1,16 +1,18 @@
 """
-Excel 画像圧縮アプリ（Streamlit）— 画像入りの重い .xlsx を自動で軽くする
+ファイル軽量化アプリ（Streamlit）— 画像で重くなった Excel / PDF を自動で軽くする
 
-現場担当者がやること … Excel(.xlsx)を上げる → 「圧縮する」を押す → 軽くなったファイルを保存
+現場担当者がやること … ファイル(.xlsx か .pdf)を上げる → ボタンを押す → 軽くなったファイルを保存
 
-しくみ:
-  .xlsx は中身が ZIP で、貼り付けた画像は xl/media/ に入っています。
-  その画像だけを「縮小 + 再圧縮」して詰め直します。表や数式・レイアウトはそのまま。
-  ・大きすぎる画像は指定サイズまで縮小
-  ・写真系のPNG（透過なし）は自動でJPEGに変換（ここで一番容量が減ります）
-  ・透過が必要なPNGはPNGのまま最適化（見た目が崩れないよう配慮）
+【Excel(.xlsx)】
+  中身のZIPにある画像(xl/media/)だけを縮小+再圧縮。表・数式・レイアウトはそのまま。
+  写真系のPNG(透過なし)は自動でJPEGに変換して強力に圧縮。
 
-  pip install streamlit Pillow
+【PDF】
+  各ページの画像を指定解像度(DPI)まで縮小し再圧縮。文字レイヤーや押印は残します。
+  「◯MB以下にする」を指定すると、その容量に収まるまで自動で調整します。
+  ※ 圧縮は画質を落とすだけで、金額・文言・押印などの内容は一切書き換えません。
+
+  pip install streamlit Pillow pymupdf
   streamlit run app.py
 """
 import io
@@ -20,23 +22,22 @@ import zipfile
 import streamlit as st
 from PIL import Image
 
-# xl/media/ 内で処理対象にする画像形式（emf/wmf などのベクタや gif は安全のため触らない）
+# ══════════════════════════════════════════════════════════
+#  Excel(.xlsx) 圧縮
+# ══════════════════════════════════════════════════════════
 TARGET_EXTS = {".png", ".jpg", ".jpeg"}
 
 
 def _process_media(raw, ext, max_dim, quality, convert_png):
-    """1枚の画像を縮小・再圧縮する。触らない場合は None を返す。
-    返り値: (新しいバイト列, 新しい拡張子)
-    """
+    """xlsx内の画像1枚を縮小・再圧縮。触らない場合は None。返り値:(bytes, 新拡張子)"""
     if ext not in TARGET_EXTS:
         return None
     try:
         im = Image.open(io.BytesIO(raw))
         im.load()
     except Exception:
-        return None  # 読めない画像はそのまま
+        return None
 
-    # ── 縮小（縦横の長い方を max_dim に収める）──
     w, h = im.size
     if max(w, h) > max_dim:
         f = max_dim / float(max(w, h))
@@ -44,34 +45,27 @@ def _process_media(raw, ext, max_dim, quality, convert_png):
 
     has_alpha = im.mode in ("RGBA", "LA") or (im.mode == "P" and "transparency" in im.info)
 
-    # ── 既存JPEG: 画質を落として再圧縮 ──
     if ext in (".jpg", ".jpeg"):
         buf = io.BytesIO()
         im.convert("RGB").save(buf, "JPEG", quality=quality, optimize=True, progressive=True)
         return buf.getvalue(), ext
-
-    # ── PNG（透過なし）を JPEG に変換（容量が最も減る）──
     if convert_png and not has_alpha:
         buf = io.BytesIO()
         im.convert("RGB").save(buf, "JPEG", quality=quality, optimize=True, progressive=True)
         return buf.getvalue(), ".jpeg"
-
-    # ── 透過PNG など: PNGのまま最適化（縮小の効果は反映される）──
     buf = io.BytesIO()
     im.save(buf, "PNG", optimize=True)
     return buf.getvalue(), ".png"
 
 
 def compress_xlsx(data, max_dim, quality, convert_png):
-    """xlsx(bytes) を受け取り、画像を圧縮した xlsx(bytes) を返す。
-    返り値: (新しいバイト列, 変更した画像枚数)
-    """
+    """xlsx(bytes) を圧縮。返り値:(bytes, 変更した画像枚数)"""
     with zipfile.ZipFile(io.BytesIO(data)) as zin:
         names = zin.namelist()
         raws = {n: zin.read(n) for n in names}
 
-    processed = {}       # 元のファイル名 -> (最終ファイル名, バイト列)
-    rename_map = {}      # 拡張子が変わった画像の basename 対応（png -> jpeg）
+    processed = {}
+    rename_map = {}
     changed = 0
 
     for name in names:
@@ -80,18 +74,15 @@ def compress_xlsx(data, max_dim, quality, convert_png):
         if not low.startswith("xl/media/"):
             processed[name] = (name, raw)
             continue
-
         ext = os.path.splitext(name)[1].lower()
         res = _process_media(raw, ext, max_dim, quality, convert_png)
         if res is None:
             processed[name] = (name, raw)
             continue
-
         new_bytes, new_ext = res
         if len(new_bytes) >= len(raw):
-            processed[name] = (name, raw)  # 小さくならないなら元のまま
+            processed[name] = (name, raw)
             continue
-
         changed += 1
         if new_ext != ext:
             new_name = name[: -len(os.path.splitext(name)[1])] + new_ext
@@ -100,7 +91,6 @@ def compress_xlsx(data, max_dim, quality, convert_png):
         else:
             processed[name] = (name, new_bytes)
 
-    # ── 拡張子が変わった画像がある場合、参照(rels)と Content_Types を書き換える ──
     if rename_map:
         for name in list(processed.keys()):
             low = name.lower()
@@ -119,7 +109,6 @@ def compress_xlsx(data, max_dim, quality, convert_png):
                 )
             processed[name] = (fname, text.encode("utf-8"))
 
-    # ── 元の順番のまま書き出す ──
     out = io.BytesIO()
     with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as zout:
         for name in names:
@@ -127,74 +116,173 @@ def compress_xlsx(data, max_dim, quality, convert_png):
             zout.writestr(fname, fbytes)
 
     result = out.getvalue()
-    # 壊れていないか最終チェック
     with zipfile.ZipFile(io.BytesIO(result)) as check:
         if check.testzip() is not None:
             raise RuntimeError("圧縮後のファイル検証に失敗しました。")
     return result, changed
 
 
+# ══════════════════════════════════════════════════════════
+#  PDF 圧縮
+# ══════════════════════════════════════════════════════════
+def compress_pdf(data, target_dpi, quality):
+    """PDF(bytes) 内の画像を target_dpi 上限・quality で再圧縮。返り値:(bytes, 変更枚数)"""
+    import fitz  # PyMuPDF
+
+    doc = fitz.open(stream=data, filetype="pdf")
+    changed = 0
+    for page in doc:
+        for img in page.get_images(full=True):
+            xref = img[0]
+            rects = page.get_image_rects(xref)
+            if not rects:
+                continue
+            disp_w = max(r.width for r in rects)
+            disp_h = max(r.height for r in rects)
+            try:
+                base = doc.extract_image(xref)
+            except Exception:
+                continue
+            pw, ph = base["width"], base["height"]
+            if not pw or not ph:
+                continue
+            scale = min((disp_w / 72 * target_dpi) / pw, (disp_h / 72 * target_dpi) / ph, 1.0)
+            try:
+                pil = Image.open(io.BytesIO(base["image"]))
+                pil.load()
+            except Exception:
+                continue
+            if scale < 0.98:
+                pil = pil.resize((max(1, int(pw * scale)), max(1, int(ph * scale))), Image.LANCZOS)
+            gray = pil.mode in ("L", "1") or base.get("colorspace") == 1
+            pil = pil.convert("L") if gray else pil.convert("RGB")
+            buf = io.BytesIO()
+            pil.save(buf, "JPEG", quality=quality, optimize=True, progressive=True)
+            if len(buf.getvalue()) < base["size"]:
+                try:
+                    page.replace_image(xref, stream=buf.getvalue())
+                    changed += 1
+                except Exception:
+                    pass
+    out = doc.tobytes(deflate=True, garbage=4, clean=True)
+    doc.close()
+    return out, changed
+
+
+# 目標サイズに収めるための試行段階（画質優先→容量優先）
+_PDF_STEPS = [(200, 82), (180, 78), (160, 72), (150, 68), (130, 65), (120, 60), (110, 55), (100, 50)]
+
+
+def compress_pdf_to_target(data, target_bytes):
+    """target_bytes 以下に収まるまで DPI/画質を段階的に下げる。
+    返り値:(bytes, 変更枚数, 使った設定文字列, 目標達成したか)"""
+    best = data
+    best_changed = 0
+    best_setting = "無圧縮"
+    for dpi, q in _PDF_STEPS:
+        out, ch = compress_pdf(data, dpi, q)
+        if len(out) < len(best):
+            best, best_changed, best_setting = out, ch, f"{dpi}dpi / 画質{q}"
+        if len(out) <= target_bytes:
+            return out, ch, f"{dpi}dpi / 画質{q}", True
+    return best, best_changed, best_setting, len(best) <= target_bytes
+
+
+# ══════════════════════════════════════════════════════════
+#  UI
+# ══════════════════════════════════════════════════════════
 def human_size(n):
+    x = float(n)
     for unit in ("B", "KB", "MB", "GB"):
-        if n < 1024 or unit == "GB":
-            return f"{n:.0f} {unit}" if unit == "B" else f"{n:,.1f} {unit}"
-        n /= 1024
+        if x < 1024 or unit == "GB":
+            return f"{x:.0f} {unit}" if unit == "B" else f"{x:,.1f} {unit}"
+        x /= 1024
 
 
-# ────────────────────────────────────────────────────────
-st.set_page_config(page_title="Excel 画像圧縮", layout="centered")
-st.title("📉 Excel 画像圧縮")
-st.caption("画像を貼って重くなった Excel(.xlsx) を、レイアウトはそのままに軽くします。")
+st.set_page_config(page_title="ファイル軽量化", layout="centered")
+st.title("📉 ファイル軽量化（Excel / PDF）")
+st.caption("画像で重くなった Excel・PDF を、見た目や内容はそのままに軽くします。")
 
 with st.sidebar:
-    st.header("圧縮の設定")
-    max_dim = st.select_slider(
-        "画像の最大サイズ（長辺・ピクセル）",
-        options=[800, 1000, 1200, 1600, 2000, 2400, 3000],
-        value=1600,
-        help="写真をこのサイズまで縮小します。小さいほど軽くなります。印刷用途なら 2000 前後がおすすめ。",
+    st.header("PDF の設定")
+    pdf_mode = st.radio(
+        "やり方", ["目標サイズ以下にする（おすすめ）", "画質を自分で決める"], index=0,
     )
-    quality = st.slider(
-        "画質（JPEG）", min_value=40, max_value=95, value=70,
-        help="低いほど軽く、荒くなります。70前後が実用的なバランスです。",
+    if pdf_mode.startswith("目標"):
+        target_mb = st.number_input(
+            "目標サイズ（MB）以下にする", min_value=0.2, max_value=50.0, value=2.0, step=0.1,
+            help="このサイズに収まるまで自動で画質を調整します。入札の上限に合わせてください。",
+        )
+        pdf_dpi = pdf_q = None
+    else:
+        target_mb = None
+        pdf_dpi = st.select_slider(
+            "解像度（DPI）", options=[100, 110, 120, 130, 150, 160, 180, 200], value=150,
+            help="低いほど軽く。150前後でも書類の文字・押印は十分読めます。",
+        )
+        pdf_q = st.slider("画質（JPEG）", 40, 95, 70)
+
+    st.divider()
+    st.header("Excel の設定")
+    xlsx_dim = st.select_slider(
+        "画像の最大サイズ（長辺px）", options=[800, 1000, 1200, 1600, 2000, 2400, 3000], value=1600,
     )
-    convert_png = st.checkbox(
-        "写真系のPNGをJPEGに変換して強力圧縮", value=True,
-        help="容量が最も減ります。透過（背景ぬき）が必要な画像は自動でPNGのまま残します。",
-    )
+    xlsx_q = st.slider("画質（Excel内画像）", 40, 95, 70, key="xq")
+    xlsx_png = st.checkbox("写真系PNGをJPEGに変換して強力圧縮", value=True)
+
+st.warning(
+    "圧縮は画質を下げるだけで、金額・文言・押印などの**内容は書き換えません**。"
+    "提出前に、押印や金額がはっきり読めるか必ずご確認ください。",
+    icon="⚠️",
+)
 
 files = st.file_uploader(
-    "Excelファイル（.xlsx）を選ぶ（複数まとめてOK）",
-    type=["xlsx"], accept_multiple_files=True,
+    "ファイル（.pdf / .xlsx）を選ぶ（複数まとめてOK）",
+    type=["pdf", "xlsx"], accept_multiple_files=True,
 )
-st.info("※ 古い形式の .xls には対応していません。Excelで「.xlsx」として保存し直してからお使いください。")
 
-if files and st.button("圧縮する", type="primary"):
+if files and st.button("軽くする", type="primary"):
     results = []
     prog = st.progress(0.0)
     for i, f in enumerate(files):
         data = f.getvalue()
+        ext = f.name.lower().rsplit(".", 1)[-1]
+        rec = {"name": f.name, "before": len(data), "after": None, "data": None,
+               "note": "", "error": None}
         try:
-            with st.spinner(f"圧縮中… {f.name}"):
-                out, changed = compress_xlsx(data, max_dim, quality, convert_png)
-            results.append({
-                "name": f.name, "before": len(data), "after": len(out),
-                "changed": changed, "data": out, "error": None,
-            })
+            with st.spinner(f"処理中… {f.name}"):
+                if ext == "pdf":
+                    if target_mb is not None:
+                        out, ch, setting, ok = compress_pdf_to_target(
+                            data, int(target_mb * 1024 * 1024))
+                        rec["note"] = (
+                            f"設定: {setting} / 画像{ch}枚を圧縮"
+                            + ("" if ok else "　⚠ 目標サイズには届きませんでした（最小まで圧縮）")
+                        )
+                        rec["ok"] = ok
+                    else:
+                        out, ch = compress_pdf(data, pdf_dpi, pdf_q)
+                        rec["note"] = f"設定: {pdf_dpi}dpi / 画質{pdf_q} / 画像{ch}枚を圧縮"
+                        rec["ok"] = True
+                elif ext == "xlsx":
+                    out, ch = compress_xlsx(data, xlsx_dim, xlsx_q, xlsx_png)
+                    rec["note"] = f"画像{ch}枚を圧縮"
+                    rec["ok"] = True
+                else:
+                    raise RuntimeError("対応していない形式です。")
+            rec["after"] = len(out)
+            rec["data"] = out
         except Exception as e:
-            results.append({
-                "name": f.name, "before": len(data), "after": None,
-                "changed": 0, "data": None, "error": str(e),
-            })
+            rec["error"] = str(e)
+        results.append(rec)
         prog.progress((i + 1) / len(files))
     st.session_state["results"] = results
 
 for r in st.session_state.get("results", []):
     st.divider()
     if r["error"]:
-        st.error(f"❌ {r['name']}：圧縮に失敗しました。詳細: {r['error']}")
+        st.error(f"❌ {r['name']}：処理に失敗しました。詳細: {r['error']}")
         continue
-
     before, after = r["before"], r["after"]
     saved = before - after
     ratio = (saved / before * 100) if before else 0
@@ -203,17 +291,12 @@ for r in st.session_state.get("results", []):
     c1.metric("元のサイズ", human_size(before))
     c2.metric("圧縮後", human_size(after), delta=f"-{human_size(saved)}", delta_color="inverse")
     c3.metric("削減率", f"{ratio:.0f}%")
-
-    if r["changed"] == 0:
-        st.info("画像が見つからないか、これ以上は軽くできませんでした（すでに軽い可能性があります）。")
-    else:
-        st.caption(f"{r['changed']} 枚の画像を圧縮しました。")
-
-    base, _ = os.path.splitext(r["name"])
+    if r.get("note"):
+        (st.caption if r.get("ok", True) else st.info)(r["note"])
+    base, ext = os.path.splitext(r["name"])
+    mime = ("application/pdf" if ext.lower() == ".pdf"
+            else "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
     st.download_button(
         "⬇ 軽くしたファイルをダウンロード",
-        data=r["data"],
-        file_name=f"{base}_軽量.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        key=f"dl_{r['name']}",
+        data=r["data"], file_name=f"{base}_軽量{ext}", mime=mime, key=f"dl_{r['name']}",
     )
