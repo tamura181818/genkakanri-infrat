@@ -1,0 +1,11 @@
+[server]
+# アップロード上限（MB）。入札書類なら100で十分。
+maxUploadSize = 100
+maxMessageSize = 100
+
+[browser]
+gatherUsageStats = false
+
+[theme]
+base = "light"
+primaryColor = "#0068C9"
