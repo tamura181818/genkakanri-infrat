@@ -15,6 +15,11 @@ var BACKUP_FOLDER_NAME = 'バックアップ';   // 同じ場所に作成／利�
 var KEEP_BACKUPS = 30;                      // 保持する世代数（古いものは自動削除）
 var BACKUP_HOUR = 2;                        // 日次バックアップの実行時刻（0-23, 深夜帯推奨）
 
+// 保護の方式:
+//   true  = 警告のみ（編集しようとすると全員に確認ポップアップ。ロックしない・推奨）
+//   false = オーナー以外は編集不可（ハード。社員の編集を完全にブロック）
+var WARNING_ONLY = true;
+
 // 保護するシートと、編集を許す例外セル（[]＝シート全体を保護）
 // ※ マスタ（工事情報・工種マスタ）と取込データ（見積取込・実績取込）は保護しません。
 var PROTECT_CONFIG = {
@@ -55,9 +60,10 @@ function pruneBackups_(folder, baseName, keep) {
 // ===== 2) 数式シートの保護 =====
 function protectFormulaSheets() {
   var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var applied = [];
   Object.keys(PROTECT_CONFIG).forEach(function (name) {
     var sh = ss.getSheetByName(name);
-    if (!sh) return;
+    if (!sh) { Logger.log('※ シートが見つかりません: ' + name); return; }
     // 既存の自動保護を貼り直す（重複防止）
     sh.getProtections(SpreadsheetApp.ProtectionType.SHEET).forEach(function (p) {
       if (p.getDescription() === '数式保護（自動）') p.remove();
@@ -67,10 +73,18 @@ function protectFormulaSheets() {
     if (ex && ex.length) {
       prot.setUnprotectedRanges(ex.map(function (a) { return sh.getRange(a); }));
     }
-    // 保護対象はオーナー（＝このスクリプト実行者）のみ編集可にする
-    prot.removeEditors(prot.getEditors());
-    if (prot.canDomainEdit()) prot.setDomainEdit(false);
+    if (WARNING_ONLY) {
+      // 編集時に確認ポップアップ（全員・オーナー含む）。ロックしない。
+      prot.setWarningOnly(true);
+    } else {
+      // オーナー以外は編集不可
+      prot.removeEditors(prot.getEditors());
+      if (prot.canDomainEdit()) prot.setDomainEdit(false);
+    }
+    applied.push(name);
   });
+  Logger.log('保護を適用: ' + (applied.join(' / ') || '（対象なし）') +
+             '　方式=' + (WARNING_ONLY ? '警告のみ' : 'オーナー以外編集不可'));
 }
 
 // 保護を一時解除したいとき（工種の追加・様式変更など）
