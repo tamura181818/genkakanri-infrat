@@ -125,11 +125,26 @@ def compress_xlsx(data, max_dim, quality, convert_png):
 # ══════════════════════════════════════════════════════════
 #  PDF 圧縮
 # ══════════════════════════════════════════════════════════
+def _open_pdf(data):
+    """PDFを開く。保護PDFは空パスワードでの解錠を試み、無理なら分かりやすい例外。"""
+    import fitz  # PyMuPDF
+
+    doc = fitz.open(stream=data, filetype="pdf")
+    if doc.is_encrypted:
+        # 「編集制限だけ（閲覧は自由）」の多くは空パスワードで解錠できる
+        if doc.authenticate("") == 0:
+            doc.close()
+            raise RuntimeError(
+                "このPDFはパスワードで保護されています。保護（パスワード）を解除してから、もう一度お試しください。"
+            )
+    return doc
+
+
 def compress_pdf(data, target_dpi, quality):
     """PDF(bytes) 内の画像を target_dpi 上限・quality で再圧縮。返り値:(bytes, 変更枚数)"""
     import fitz  # PyMuPDF
 
-    doc = fitz.open(stream=data, filetype="pdf")
+    doc = _open_pdf(data)
     changed = 0
     for page in doc:
         for img in page.get_images(full=True):
@@ -171,7 +186,9 @@ def compress_pdf(data, target_dpi, quality):
         doc.close()
         return data, 0
 
-    out = doc.tobytes(deflate=True, deflate_images=True, garbage=4, clean=True)
+    import fitz  # PyMuPDF
+    out = doc.tobytes(deflate=True, deflate_images=True, garbage=4, clean=True,
+                      encryption=fitz.PDF_ENCRYPT_NONE)
     doc.close()
     # 万一、元より大きくなったら元のまま返す（絶対に膨らませない）
     if len(out) >= len(data):
@@ -179,8 +196,12 @@ def compress_pdf(data, target_dpi, quality):
     return out, changed
 
 
-# 目標サイズに収めるための試行段階（画質優先→容量優先）
-_PDF_STEPS = [(200, 82), (180, 78), (160, 72), (150, 68), (130, 65), (120, 60), (110, 55), (100, 50)]
+# 目標サイズに収めるための試行段階（画質優先→容量優先）。
+# 後半（低DPI）は「どうしても目標に収めたい大きなスキャン」向けの最終手段。
+_PDF_STEPS = [(200, 82), (180, 78), (160, 72), (150, 68), (130, 65), (120, 60),
+              (110, 55), (100, 50), (90, 45), (80, 42), (72, 40)]
+# これ未満のDPIになったら「文字が読めるか要確認」の注意を出す閾値
+_PDF_LOWDPI = 110
 
 
 def compress_pdf_to_target(data, target_bytes):
@@ -294,6 +315,17 @@ if files and st.button("軽くする", type="primary"):
                     else:
                         rec["note"] = f"設定: {setting} / 画像{ch}枚を圧縮"
                         rec["ok"] = True
+                        # 大きく画質を下げた場合は判読の確認をより強く促す
+                        try:
+                            used_dpi = int(str(setting).split("dpi")[0])
+                        except (ValueError, AttributeError):
+                            used_dpi = 999
+                        if used_dpi < _PDF_LOWDPI:
+                            rec["note"] += (
+                                "　⚠ 目標に収めるため画質をかなり下げました。"
+                                "文字・押印がはっきり読めるか特に念入りにご確認ください。"
+                            )
+                            rec["ok"] = False
                 elif ext == "xlsx":
                     out, ch = compress_xlsx(data, xlsx_dim, xlsx_q, xlsx_png)
                     if len(out) >= len(data):
