@@ -35,6 +35,7 @@ KUBUN = ["材料", "機械", "労務", "経費"]
 SHEET_MI, SHEET_JI, SHEET_MASTER = "見積取込", "実績取込", "工種マスタ"
 COLS = ["工種", "区分", "項目", "数量", "単位", "単価", "金額"]
 DEFAULT_TAX = 10  # 税率(%) 既定値
+BAK_PREFIX = "_bak_"  # 上書き前スナップショットの退避タブ接頭辞
 
 def to_num(x):
     if x is None: return 0
@@ -87,6 +88,14 @@ def overwrite_ws(sid, name, matrix):
     ws.clear()
     if matrix:
         ws.update(matrix, value_input_option="USER_ENTERED")
+
+def snapshot_sheet(sid, sheet_name):
+    """上書きの直前に、対象シートの現在値を退避タブ（_bak_<シート名>）へ1世代保存する。"""
+    vals, _, err = read_sheet_raw(sid, sheet_name)
+    if err or not vals:
+        return False
+    overwrite_ws(sid, BAK_PREFIX + sheet_name, vals)
+    return True
 
 def uniquify(header):
     seen, cols = {}, []
@@ -345,16 +354,30 @@ def render_edit(koji, sid):
     if n_after != n_before:
         st.info(f"行数: {n_before} → {n_after}（{n_after - n_before:+d}）")
 
-    st.warning("『上書き保存』はシート全体を現在の表の内容に置き換えます。元に戻せません。内容をよくご確認ください。")
+    st.warning("『上書き保存』はシート全体を現在の表の内容に置き換えます。保存の直前に自動で退避を取るので、直後なら『直前の状態に戻す』で1回だけ元に戻せます。")
     confirm = st.checkbox("内容を確認しました。上書き保存する")
     if st.button("上書き保存", type="primary", disabled=not confirm):
         try:
             body = [[("" if pd.isna(v) else v) for v in row] for row in edited.values.tolist()]
+            snapshot_sheet(sid, sheet)  # 上書き前スナップショット（ワンステップ取り消し用）
             overwrite_ws(sid, sheet, top + body)
             clear_data_cache()
-            st.success(f"「{sheet}」を上書き保存しました（{len(body)} 行）。台帳が自動更新されます。")
+            st.success(f"「{sheet}」を上書き保存しました（{len(body)} 行）。直前の内容は「{BAK_PREFIX + sheet}」タブに退避しています。台帳が自動更新されます。")
         except Exception as e:
             st.error(f"保存に失敗しました。詳細: {e}")
+
+    # ── ワンステップ取り消し（直前の退避から復元）──
+    bak_vals, _, bak_err = read_sheet_raw(sid, BAK_PREFIX + sheet)
+    if not bak_err and bak_vals:
+        st.divider()
+        st.caption(f"直前の上書き前の状態が「{BAK_PREFIX + sheet}」に保存されています。誤って上書きした場合はここから戻せます。")
+        if st.button(f"⏪ 「{pick}」を直前の状態に戻す", key=f"restore_{sheet}"):
+            try:
+                overwrite_ws(sid, sheet, bak_vals)
+                clear_data_cache()
+                st.success(f"「{sheet}」を直前の状態に戻しました。台帳が自動更新されます。")
+            except Exception as e:
+                st.error(f"復元に失敗しました。詳細: {e}")
 
 # ────────────────────────────────────────────────────────
 st.title("見積・請求 取込")
