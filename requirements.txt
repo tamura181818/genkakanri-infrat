@@ -1,6 +1,2 @@
 streamlit
-gspread
-google-auth
-pandas
-openpyxl
-google-generativeai
+Pillow

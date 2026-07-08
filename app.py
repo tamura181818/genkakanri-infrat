@@ -1,185 +1,219 @@
 """
-見積・請求 取込アプリ（Streamlit）— 工事ごとのスプレッドシートへ自動追記
-※ 見積書は全形式（紙・PDF・Excel）をAI（Gemini）で読み取ります。
+Excel 画像圧縮アプリ（Streamlit）— 画像入りの重い .xlsx を自動で軽くする
 
-現場担当者がやること … 工事を選ぶ → 見積/請求を選ぶ → ファイルを上げる(または手入力)
-   → 工種と区分を確認 → 保存。あとは台帳(スプレッドシート)が自動更新。
+現場担当者がやること … Excel(.xlsx)を上げる → 「圧縮する」を押す → 軽くなったファイルを保存
 
-管理者が最初に1回だけ設定（.streamlit/secrets.toml、GitHubには載せない）:
-  [gcp_service_account] … サービスアカウントのJSONの中身
-  GEMINI_API_KEY = "xxxx"                      … 見積読み取りに必須
-  [projects]  "工事名" = "スプレッドシートID"   … 工事一覧
+しくみ:
+  .xlsx は中身が ZIP で、貼り付けた画像は xl/media/ に入っています。
+  その画像だけを「縮小 + 再圧縮」して詰め直します。表や数式・レイアウトはそのまま。
+  ・大きすぎる画像は指定サイズまで縮小
+  ・写真系のPNG（透過なし）は自動でJPEGに変換（ここで一番容量が減ります）
+  ・透過が必要なPNGはPNGのまま最適化（見た目が崩れないよう配慮）
 
-  pip install streamlit gspread google-auth pandas openpyxl google-generativeai
+  pip install streamlit Pillow
   streamlit run app.py
 """
-import re, json
-import pandas as pd
+import io
+import os
+import zipfile
+
 import streamlit as st
+from PIL import Image
 
-st.set_page_config(page_title="見積・請求 取込", layout="wide")
+# xl/media/ 内で処理対象にする画像形式（emf/wmf などのベクタや gif は安全のため触らない）
+TARGET_EXTS = {".png", ".jpg", ".jpeg"}
 
-KUBUN = ["材料", "機械", "労務", "経費"]
-SHEET_MI, SHEET_JI, SHEET_MASTER = "見積取込", "実績取込", "工種マスタ"
-COLS = ["工種", "区分", "項目", "数量", "単位", "単価", "金額"]
 
-def to_num(x):
-    if x is None: return 0
-    s = re.sub(r"[^\d.\-]", "", str(x))
-    try: return float(s) if s not in ("", "-", ".") else 0
-    except: return 0
-
-# ── gspread（認証は secrets から）──
-@st.cache_resource
-def get_client():
-    import gspread
-    from google.oauth2.service_account import Credentials
-    info = dict(st.secrets["gcp_service_account"])
-    creds = Credentials.from_service_account_info(info, scopes=["https://www.googleapis.com/auth/spreadsheets"])
-    return gspread.authorize(creds)
-
-def get_projects():
-    return dict(st.secrets.get("projects", {}))
-
-@st.cache_data(ttl=300)
-def get_koshu(sid):
+def _process_media(raw, ext, max_dim, quality, convert_png):
+    """1枚の画像を縮小・再圧縮する。触らない場合は None を返す。
+    返り値: (新しいバイト列, 新しい拡張子)
+    """
+    if ext not in TARGET_EXTS:
+        return None
     try:
-        ws = get_client().open_by_key(sid).worksheet(SHEET_MASTER)
-        return [v for v in ws.col_values(1)[2:] if v]
+        im = Image.open(io.BytesIO(raw))
+        im.load()
     except Exception:
-        return []
+        return None  # 読めない画像はそのまま
 
-def append_rows(sid, sheet_name, rows):
-    ws = get_client().open_by_key(sid).worksheet(sheet_name)
-    ws.append_rows(rows, value_input_option="USER_ENTERED")
+    # ── 縮小（縦横の長い方を max_dim に収める）──
+    w, h = im.size
+    if max(w, h) > max_dim:
+        f = max_dim / float(max(w, h))
+        im = im.resize((max(1, round(w * f)), max(1, round(h * f))), Image.LANCZOS)
 
-# ── 見積の読み取り（全形式をAI＝Geminiで判断）──
-PROMPT = ("建設の下請け見積書です。明細行をすべて抽出してください。"
-          "各行に、工種(下のリストから最も近いものを選ぶ)・区分(材料/機械/労務/経費)・"
-          "項目・数量・単位・単価・金額 を付けてください。"
-          "単価や数量が書かれていない『一式』の行は、金額だけ入れて数量・単価は空でよい。"
-          "小計・合計・総括などの集計行は除き、実際の明細だけを返してください。"
-          "工種リスト: {koshu}。"
-          'JSONのみ返答、前置き・コードブロック不要。'
-          '形式:[{{"工種":"","区分":"材料","項目":"","数量":0,"単位":"","単価":0,"金額":0}}]')
+    has_alpha = im.mode in ("RGBA", "LA") or (im.mode == "P" and "transparency" in im.info)
 
-def _ai_call(parts, koshu):
-    key = st.secrets.get("GEMINI_API_KEY", None)
-    if not key:
-        return None, "見積の自動読み取りには、管理者のGemini設定(GEMINI_API_KEY)が必要です。下の表に手入力してください。"
-    import google.generativeai as genai
-    genai.configure(api_key=key)
-    model = genai.GenerativeModel("gemini-2.0-flash")
-    prompt = PROMPT.format(koshu="・".join(koshu) if koshu else "（工種リストなし・推定可）")
-    try:
-        resp = model.generate_content(parts + [prompt])
-        txt = (resp.text or "").replace("```json", "").replace("```", "").strip()
-        data = json.loads(txt)
-        df = pd.DataFrame(data)
-        for c, d in [("工種", ""), ("区分", "材料"), ("項目", ""), ("数量", ""), ("単位", ""), ("単価", ""), ("金額", 0)]:
-            if c not in df: df[c] = d
-        return df[COLS], None
-    except Exception as e:
-        return None, f"自動読み取りに失敗しました。手入力に切り替えてください。詳細: {e}"
+    # ── 既存JPEG: 画質を落として再圧縮 ──
+    if ext in (".jpg", ".jpeg"):
+        buf = io.BytesIO()
+        im.convert("RGB").save(buf, "JPEG", quality=quality, optimize=True, progressive=True)
+        return buf.getvalue(), ext
 
-def parse_ai_file(file_bytes, mime, koshu):
-    # PDF・画像はそのままAIへ
-    return _ai_call([{"mime_type": mime, "data": file_bytes}], koshu)
+    # ── PNG（透過なし）を JPEG に変換（容量が最も減る）──
+    if convert_png and not has_alpha:
+        buf = io.BytesIO()
+        im.convert("RGB").save(buf, "JPEG", quality=quality, optimize=True, progressive=True)
+        return buf.getvalue(), ".jpeg"
 
-def parse_ai_excel(file, koshu):
-    # ExcelはAIに渡せないので、全セルをテキスト化してAIへ
-    try:
-        xls = pd.read_excel(file, sheet_name=None, header=None)
-    except Exception as e:
-        return None, f"Excelを読めませんでした: {e}"
-    lines = []
-    for name, df in xls.items():
-        lines.append(f"[シート: {name}]")
-        for _, r in df.iterrows():
-            cells = [str(c) for c in r.tolist() if pd.notna(c)]
-            if cells: lines.append(" | ".join(cells))
-    text = "次はExcel見積書の中身です。\n" + "\n".join(lines[:400])
-    return _ai_call([text], koshu)
+    # ── 透過PNG など: PNGのまま最適化（縮小の効果は反映される）──
+    buf = io.BytesIO()
+    im.save(buf, "PNG", optimize=True)
+    return buf.getvalue(), ".png"
+
+
+def compress_xlsx(data, max_dim, quality, convert_png):
+    """xlsx(bytes) を受け取り、画像を圧縮した xlsx(bytes) を返す。
+    返り値: (新しいバイト列, 変更した画像枚数)
+    """
+    with zipfile.ZipFile(io.BytesIO(data)) as zin:
+        names = zin.namelist()
+        raws = {n: zin.read(n) for n in names}
+
+    processed = {}       # 元のファイル名 -> (最終ファイル名, バイト列)
+    rename_map = {}      # 拡張子が変わった画像の basename 対応（png -> jpeg）
+    changed = 0
+
+    for name in names:
+        raw = raws[name]
+        low = name.lower()
+        if not low.startswith("xl/media/"):
+            processed[name] = (name, raw)
+            continue
+
+        ext = os.path.splitext(name)[1].lower()
+        res = _process_media(raw, ext, max_dim, quality, convert_png)
+        if res is None:
+            processed[name] = (name, raw)
+            continue
+
+        new_bytes, new_ext = res
+        if len(new_bytes) >= len(raw):
+            processed[name] = (name, raw)  # 小さくならないなら元のまま
+            continue
+
+        changed += 1
+        if new_ext != ext:
+            new_name = name[: -len(os.path.splitext(name)[1])] + new_ext
+            rename_map[os.path.basename(name)] = os.path.basename(new_name)
+            processed[name] = (new_name, new_bytes)
+        else:
+            processed[name] = (name, new_bytes)
+
+    # ── 拡張子が変わった画像がある場合、参照(rels)と Content_Types を書き換える ──
+    if rename_map:
+        for name in list(processed.keys()):
+            low = name.lower()
+            if not (low.endswith(".rels") or low == "[content_types].xml"):
+                continue
+            fname, fbytes = processed[name]
+            try:
+                text = fbytes.decode("utf-8")
+            except UnicodeDecodeError:
+                continue
+            for old, new in rename_map.items():
+                text = text.replace(old, new)
+            if low == "[content_types].xml" and 'Extension="jpeg"' not in text:
+                text = text.replace(
+                    "</Types>", '<Default Extension="jpeg" ContentType="image/jpeg"/></Types>'
+                )
+            processed[name] = (fname, text.encode("utf-8"))
+
+    # ── 元の順番のまま書き出す ──
+    out = io.BytesIO()
+    with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as zout:
+        for name in names:
+            fname, fbytes = processed[name]
+            zout.writestr(fname, fbytes)
+
+    result = out.getvalue()
+    # 壊れていないか最終チェック
+    with zipfile.ZipFile(io.BytesIO(result)) as check:
+        if check.testzip() is not None:
+            raise RuntimeError("圧縮後のファイル検証に失敗しました。")
+    return result, changed
+
+
+def human_size(n):
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024 or unit == "GB":
+            return f"{n:.0f} {unit}" if unit == "B" else f"{n:,.1f} {unit}"
+        n /= 1024
+
 
 # ────────────────────────────────────────────────────────
-st.title("見積・請求 取込")
+st.set_page_config(page_title="Excel 画像圧縮", layout="centered")
+st.title("📉 Excel 画像圧縮")
+st.caption("画像を貼って重くなった Excel(.xlsx) を、レイアウトはそのままに軽くします。")
 
-projects = get_projects()
-if not projects:
-    st.warning("工事が登録されていません。管理者に secrets の [projects] 設定を依頼してください。")
-    st.stop()
+with st.sidebar:
+    st.header("圧縮の設定")
+    max_dim = st.select_slider(
+        "画像の最大サイズ（長辺・ピクセル）",
+        options=[800, 1000, 1200, 1600, 2000, 2400, 3000],
+        value=1600,
+        help="写真をこのサイズまで縮小します。小さいほど軽くなります。印刷用途なら 2000 前後がおすすめ。",
+    )
+    quality = st.slider(
+        "画質（JPEG）", min_value=40, max_value=95, value=70,
+        help="低いほど軽く、荒くなります。70前後が実用的なバランスです。",
+    )
+    convert_png = st.checkbox(
+        "写真系のPNGをJPEGに変換して強力圧縮", value=True,
+        help="容量が最も減ります。透過（背景ぬき）が必要な画像は自動でPNGのまま残します。",
+    )
 
-c1, c2 = st.columns([2, 1])
-koji = c1.selectbox("工事を選ぶ", list(projects.keys()))
-mode = c2.radio("種別", ["見積（予算）", "請求（実績）"], horizontal=True)
-is_seikyu = mode.startswith("請求")
-sid = projects[koji]
-koshu = get_koshu(sid)
-if not koshu:
-    st.info("この工事の工種マスタを読めませんでした。スプレッドシートがサービスアカウントに共有されているか確認してください。")
+files = st.file_uploader(
+    "Excelファイル（.xlsx）を選ぶ（複数まとめてOK）",
+    type=["xlsx"], accept_multiple_files=True,
+)
+st.info("※ 古い形式の .xls には対応していません。Excelで「.xlsx」として保存し直してからお使いください。")
 
-h1, h2, h3 = st.columns(3)
-gyosha = h1.text_input("業者名")
-hiduke = h2.text_input("請求日（締め日）" if is_seikyu else "見積日", placeholder="2026/07/31")
-if is_seikyu:
-    shiharai = h3.selectbox("支払区分", ["月締め", "出来高払い"]); ver = keiyaku = None
-else:
-    ver = h3.selectbox("版", ["当初", "変更", "追加"])
-    keiyaku = "未契約" if ver == "追加" else "契約済"
-
-up = st.file_uploader(f"{('請求' if is_seikyu else '見積')}書（Excel / PDF / 写真）を上げてAI読み取り（任意）",
-                      type=["xlsx", "xls", "pdf", "png", "jpg", "jpeg"])
-if "rows" not in st.session_state:
-    st.session_state.rows = pd.DataFrame([{c: ("材料" if c == "区分" else "") for c in COLS}])
-
-if up is not None and st.button("AIで読み取り"):
-    ext = up.name.lower().rsplit(".", 1)[-1]
-    with st.spinner("AIが読み取り中…"):
-        if ext in ("xlsx", "xls"):
-            df, err = parse_ai_excel(up, koshu)
-        elif ext == "pdf":
-            df, err = parse_ai_file(up.getvalue(), "application/pdf", koshu)
-        else:
-            df, err = parse_ai_file(up.getvalue(), up.type or "image/jpeg", koshu)
-    if err:
-        st.info(err)
-    elif df is not None and not df.empty:
-        st.session_state.rows = df.reindex(columns=COLS).fillna("")
-        st.success(f"{len(df)} 行を読み取りました。工種・区分・金額を確認してください。")
-
-st.caption("工種と区分を確認・修正してください（AIの下書きは完璧ではありません）。金額は数量×単価が空なら手入力。")
-edited = st.data_editor(
-    st.session_state.rows, use_container_width=True, num_rows="dynamic",
-    column_config={
-        "工種": st.column_config.SelectboxColumn("工種", options=koshu or [""]),
-        "区分": st.column_config.SelectboxColumn("区分", options=KUBUN),
-    })
-
-def calc_amt(row):
-    q, u, a = to_num(row.get("数量")), to_num(row.get("単価")), to_num(row.get("金額"))
-    return q * u if (q and u) else a
-edited = edited.copy()
-edited["金額計"] = edited.apply(calc_amt, axis=1)
-
-sums = {k: int(edited.loc[edited["区分"] == k, "金額計"].sum()) for k in KUBUN}
-m = st.columns(5)
-for i, k in enumerate(KUBUN): m[i].metric(k, f"¥{sums[k]:,}")
-m[4].metric("合計", f"¥{sum(sums.values()):,}")
-
-if st.button(f"{'請求' if is_seikyu else '見積'}を保存（{koji} のシートに追記）", type="primary"):
-    valid = edited[(edited["工種"].astype(str) != "") & (edited["金額計"] > 0)]
-    if valid.empty:
-        st.error("工種と金額が入った行がありません。")
-    else:
+if files and st.button("圧縮する", type="primary"):
+    results = []
+    prog = st.progress(0.0)
+    for i, f in enumerate(files):
+        data = f.getvalue()
         try:
-            if is_seikyu:
-                rows = [[r["工種"], r["区分"], r["項目"], int(r["金額計"]), gyosha, hiduke, shiharai] for _, r in valid.iterrows()]
-                append_rows(sid, SHEET_JI, rows)
-            else:
-                rows = [[r["工種"], ver, r["区分"], r["項目"], to_num(r["数量"]) or "", r["単位"],
-                         to_num(r["単価"]) or "", int(r["金額計"]), gyosha, hiduke, keiyaku] for _, r in valid.iterrows()]
-                append_rows(sid, SHEET_MI, rows)
-            st.success(f"{koji} の「{SHEET_JI if is_seikyu else SHEET_MI}」に {len(rows)} 行を追記しました。台帳が自動更新されます。")
-            st.session_state.rows = pd.DataFrame([{c: ("材料" if c == "区分" else "") for c in COLS}])
+            with st.spinner(f"圧縮中… {f.name}"):
+                out, changed = compress_xlsx(data, max_dim, quality, convert_png)
+            results.append({
+                "name": f.name, "before": len(data), "after": len(out),
+                "changed": changed, "data": out, "error": None,
+            })
         except Exception as e:
-            st.error(f"保存に失敗しました。共有と secrets 設定を確認してください。詳細: {e}")
+            results.append({
+                "name": f.name, "before": len(data), "after": None,
+                "changed": 0, "data": None, "error": str(e),
+            })
+        prog.progress((i + 1) / len(files))
+    st.session_state["results"] = results
+
+for r in st.session_state.get("results", []):
+    st.divider()
+    if r["error"]:
+        st.error(f"❌ {r['name']}：圧縮に失敗しました。詳細: {r['error']}")
+        continue
+
+    before, after = r["before"], r["after"]
+    saved = before - after
+    ratio = (saved / before * 100) if before else 0
+    st.subheader(r["name"])
+    c1, c2, c3 = st.columns(3)
+    c1.metric("元のサイズ", human_size(before))
+    c2.metric("圧縮後", human_size(after), delta=f"-{human_size(saved)}", delta_color="inverse")
+    c3.metric("削減率", f"{ratio:.0f}%")
+
+    if r["changed"] == 0:
+        st.info("画像が見つからないか、これ以上は軽くできませんでした（すでに軽い可能性があります）。")
+    else:
+        st.caption(f"{r['changed']} 枚の画像を圧縮しました。")
+
+    base, _ = os.path.splitext(r["name"])
+    st.download_button(
+        "⬇ 軽くしたファイルをダウンロード",
+        data=r["data"],
+        file_name=f"{base}_軽量.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        key=f"dl_{r['name']}",
+    )
