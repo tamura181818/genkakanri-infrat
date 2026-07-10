@@ -31,7 +31,8 @@ def normalize_era(text) -> str | None:
     """'令和8年2月' -> '2026-02'。西暦 'YYYY-MM'/'YYYY/MM' もそのまま整形。"""
     if not text:
         return None
-    s = common.to_halfwidth(str(text)).strip()
+    # 全角→半角し、内部スペースも除去（"2025年 9月" / "令和 7年 9月" を吸収）
+    s = common.strip_all_spaces(common.to_halfwidth(str(text)))
     m = re.search(r"(令和|平成|昭和)\s*(\d+|元)\s*年\s*(\d+)?\s*月?", s)
     if m:
         era, y, mo = m.group(1), m.group(2), m.group(3)
@@ -77,8 +78,8 @@ def validate_work(work_id: str, labor_cfg: dict, unit_map: dict, tol: float) -> 
         judgment, reason = common.judge_labor(r, labor_cfg)
         ok, rel = checksum(r, tol)
         review_reasons = []
-        if judgment == "要レビュー":
-            review_reasons.append(f"労務判定:{reason}")
+        if judgment in ("除外", "要レビュー"):
+            review_reasons.append(f"{judgment}:{reason}")
         if not ok:
             review_reasons.append(f"検算誤差{rel:.1%}>許容{tol:.0%}")
 

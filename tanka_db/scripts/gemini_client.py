@@ -6,15 +6,17 @@ Gemini 呼び出しラッパ。
 - google-generativeai 未インストール / キー未設定でも import は通り、
   実際に呼んだ時点で分かりやすいエラーを出す（scripts 単体テストのため）。
 
-モデルは設計書 §4 に従い Flash / Flash-Lite を切替可能:
-  gemini-2.5-flash / gemini-2.5-flash-lite
+モデルは設計書 §4 に従い Flash / Flash-Lite を切替可能。
+新規 API キーでは 'gemini-2.5-flash' 直指定が 404 になる場合があるため、
+既定は安定エイリアスの 'gemini-flash-latest'（Flash-Lite は
+'gemini-flash-lite-latest'）とする。GEMINI_MODEL で上書き可。
 """
 from __future__ import annotations
 
 import json
 import os
 
-DEFAULT_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+DEFAULT_MODEL = os.environ.get("GEMINI_MODEL", "gemini-flash-latest")
 
 
 class GeminiUnavailable(RuntimeError):

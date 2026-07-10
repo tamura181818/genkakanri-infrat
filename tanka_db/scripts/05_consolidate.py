@@ -59,11 +59,16 @@ def write_csv(path: Path, rows: list[dict], columns: list[str]) -> None:
 def main() -> None:
     ap = argparse.ArgumentParser(description="全工事統合 -> CSV")
     ap.add_argument("--out-dir", default=str(common.OUTPUT))
+    ap.add_argument("--work-id", action="append",
+                    help="対象を限定(複数指定可)。省略時は work/ 配下すべて")
     args = ap.parse_args()
 
     out_dir = Path(args.out_dir)
     work_dirs = [p for p in sorted(common.WORK.iterdir())
                  if p.is_dir() and (p / "validated.jsonl").exists()]
+    if args.work_id:
+        wanted = set(args.work_id)
+        work_dirs = [p for p in work_dirs if p.name in wanted]
     if not work_dirs:
         sys.exit("validated.jsonl がありません。先に 04_validate を実行してください。")
 

@@ -22,7 +22,10 @@ pip install -r requirements.txt
 # 画像化に poppler-utils が必要
 sudo apt-get install poppler-utils          # or: brew install poppler
 export GEMINI_API_KEY=xxxx                   # 抽出に必須
-export GEMINI_MODEL=gemini-2.5-flash         # 任意。flash-lite と比較検証可
+export GEMINI_MODEL=gemini-flash-latest      # 既定。flash-lite と比較検証可
+# 注: 新規キーは 'gemini-2.5-flash' 直指定が 404 になる場合あり。
+#     その場合は gemini-flash-latest / gemini-flash-lite-latest を使う。
+#     cryptography/cffi 起因の import エラー時: pip install -U cffi cryptography
 ```
 
 ## 実行（1 工事で検証 → 全工事へ）

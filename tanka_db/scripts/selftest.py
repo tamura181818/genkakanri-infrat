@@ -150,7 +150,7 @@ def run_e2e(v) -> bool:
 
         # 05（out-dir を退避先にして本番 output/ を汚さない）
         subprocess.run([sys.executable, str(HERE / "05_consolidate.py"),
-                        "--out-dir", str(out_dir)], check=True, cwd=HERE)
+                        "--work-id", wid, "--out-dir", str(out_dir)], check=True, cwd=HERE)
         db_csv = (out_dir / "単価一覧.csv").read_text(encoding="utf-8").splitlines()
         # ヘッダ + 主体足場1行（重複除去済み） = 2 行
         if len(db_csv) != 2:

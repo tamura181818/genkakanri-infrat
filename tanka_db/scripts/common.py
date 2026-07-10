@@ -184,11 +184,16 @@ def judge_labor(row: dict, labor_cfg: dict) -> tuple[str, str]:
     labor_units = labor_cfg.get("labor_units", ["人", "人日"])
     occ = labor_cfg.get("occupations", set())
 
+    kingaku = to_num(row.get("金額"))
+
     # 段1: 号参照フィルタ / 集計行フィルタ → 除外（中間集計であり最下層でない）
     if is_ref or re.search(r"(単-|内-)", tekiyo):
         return "除外", "号参照(中間集計)"
     if tanka is None and norm_unit == "式":
         return "除外", "式・単価空欄(費目集計行)"
+    # 単価も金額も無い行は最下層単価ではない（見出し・区切り・空行）→ 除外
+    if tanka is None and kingaku is None:
+        return "除外", "非単価行(見出し/空欄)"
 
     # 段2: 除外辞書 × 単位併用判定（設計書 §1-2）
     #   純粋労務は 人/人日 単位が原則。過剰除去を防ぐため、施工単位(m2等)を
