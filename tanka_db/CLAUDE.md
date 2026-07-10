@@ -76,11 +76,19 @@ python 05_consolidate.py
 重複方針: 同一工事内の完全重複は除去。工事・単価適用年月が異なる同一品目は
 別レコードとして残す（時系列・事務所間比較のため）。
 
+## モデル選定の検証結果（1 工事・57 ページ）
+
+同一ページを Flash / Flash-Lite で比較した結果、**Flash を推奨**:
+- Flash: DB 保持 126 行すべてで単価を取得。
+- Flash-Lite: 単価カラムを空で落とす取り違えが多発（保持相当 126 行中、
+  単価が入ったのは 32 行のみ）。→ 約 75% が要修正。
+既定モデルは `gemini-flash-latest`（≒2.5 Flash 系エイリアス）。
+
 ## 未確定・要決定（設計書 §6）
 
-運転費の除外可否 / 単価適用年月カラム / 抽出モデル(Flash vs Flash-Lite) /
-DPI(150 vs 200) / 重複方針 / 出力先(CSV or gspread) / 検索 UI(GAS or Streamlit) /
-様式ゆれ。1 工事検証後に `review_flags.csv` を見ながら田村さんと確定する。
+抽出モデルは **Flash に確定**（上記検証）。残り: 運転費の除外可否 /
+単価適用年月カラム / DPI(150 vs 200) / 重複方針 / 出力先(CSV or gspread) /
+検索 UI(GAS or Streamlit) / 様式ゆれ。`review_flags.csv` を見ながら田村さんと確定。
 
 ## 自己テスト
 

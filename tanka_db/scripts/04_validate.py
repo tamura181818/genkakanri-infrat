@@ -87,8 +87,14 @@ def validate_work(work_id: str, labor_cfg: dict, unit_map: dict, tol: float) -> 
         if not unit_known and unit_norm:
             review_reasons.append(f"未知単位:{unit_norm}")
 
-        # is_kept: 保持 かつ 検算OK。除外行は DB 本体から外す（review には残す）。
-        is_kept = (judgment == "保持") and ok
+        # 保持判定でも単価が読めていなければ DB に入れられない → 要レビューへ降格。
+        tanka_val = common.to_num(r.get("単価"))
+        missing_price = (judgment == "保持") and tanka_val is None
+        if missing_price:
+            review_reasons.append("単価未読取(保持だが単価空)")
+
+        # is_kept: 保持 かつ 検算OK かつ 単価あり。除外行は DB 本体から外す。
+        is_kept = (judgment == "保持") and ok and not missing_price
 
         rec = {
             "work_id": work_id,
@@ -113,12 +119,13 @@ def validate_work(work_id: str, labor_cfg: dict, unit_map: dict, tol: float) -> 
             "検算相対誤差": round(rel, 4) if rel is not None else None,
         }
         out.append(rec)
+        # 最終状態で集計（除外 / DB保持 / それ以外は要レビュー）。
         if judgment == "除外":
             n_excl += 1
-        elif judgment == "要レビュー" or not ok:
-            n_review += 1
         elif is_kept:
             n_keep += 1
+        else:
+            n_review += 1
 
     common.write_jsonl(wdir / "validated.jsonl", out)
     print(f"[validate] {work_id}: 保持{n_keep} / 除外{n_excl} / 要レビュー{n_review} "
