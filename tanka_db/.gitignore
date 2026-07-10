@@ -1,0 +1,10 @@
+# 生成物・入力データはコミットしない（構造だけ .gitkeep で保持）
+input_pdfs/*
+!input_pdfs/.gitkeep
+work/*
+!work/.gitkeep
+output/*
+!output/.gitkeep
+
+__pycache__/
+*.pyc

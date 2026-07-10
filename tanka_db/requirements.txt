@@ -1,0 +1,7 @@
+# 単価DBパイプライン用の依存。既存ルート app.py(見積取込) とは独立。
+PyYAML
+pandas
+google-generativeai
+# 画像化には別途 poppler-utils(pdftoppm) が必要（pip 管理外）:
+#   Debian/Ubuntu: sudo apt-get install poppler-utils
+#   macOS(brew):    brew install poppler
